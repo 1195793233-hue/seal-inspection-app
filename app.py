@@ -419,7 +419,6 @@ def check_keyword_in_text(text, keywords):
 # 审核核心逻辑
 # ============================================================
 
-@st.cache_data(ttl=60)
 def determine_material_type(file_name, standards):
     """
     第零步：判定物料类型（电子料 vs 结构件）
@@ -1325,9 +1324,8 @@ def run_full_inspection(file_path, file_name, standards):
     version = standards.get("version", "未知")
 
     # 提取PDF并逐页分析（V4.0 核心）
-    with st.spinner(f"正在逐页分析PDF: {file_name}..."):
-        page_analysis = analyze_pdf_page_by_page(file_path)
-        all_text = extract_all_text(file_path)
+    page_analysis = analyze_pdf_page_by_page(file_path)
+    all_text = extract_all_text(file_path)
 
     # 第零步：物料类型判定
     mat_type, mat_type_cn, mat_kw, needs_elec = determine_material_type(file_name, standards)
