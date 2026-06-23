@@ -27,10 +27,8 @@ def load_standards():
         with open("inspection_standards.json", "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        st.error("❌ 找不到标准文件 inspection_standards.json")
         return None
     except Exception as e:
-        st.error(f"❌ 读取标准文件失败: {e}")
         return None
 
 # ============================================================
@@ -1427,6 +1425,7 @@ st.set_page_config(
 # 加载标准
 standards = load_standards()
 if standards is None:
+    st.error("❌ 无法加载审核标准文件（inspection_standards.json），请确认文件存在")
     st.stop()
 
 version = standards.get("version", "未知")
@@ -1545,8 +1544,23 @@ with col2:
 
             for i, (fp, fname) in enumerate(all_paths):
                 with st.spinner(f"正在审核: {fname}"):
-                    res = run_full_inspection(fp, fname, standards)
-                    detail_results.append(res)
+                    try:
+                        res = run_full_inspection(fp, fname, standards)
+                        detail_results.append(res)
+                    except Exception as e:
+                        st.error(f"❌ 审核文件 {fname} 时出错: {e}")
+                        detail_results.append({
+                            "文件名": fname,
+                            "总体结论": f"❌ 审核异常: {str(e)[:50]}",
+                            "问题数量": 1,
+                            "_detail": {"final": {"verdict": f"❌ 异常", "suggestion": f"审核出错: {e}"}},
+                            **{k: "⏱ 异常" for k in [
+                                "文件类型","物料类型","需要电气性能测试",
+                                "文件完整性","RoHS合规性","CPK合规性",
+                                "尺寸对应性","报告时效性","目录勾选状态","料号一致性",
+                                "审核时间","标准版本"
+                            ]}
+                        })
                 progress.progress((i + 1) / len(all_paths))
 
             st.success(f"✅ 审核完成！共审核 **{len(detail_results)}** 个文件")
