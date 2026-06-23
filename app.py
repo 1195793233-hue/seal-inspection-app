@@ -35,7 +35,7 @@ def load_standards():
 
 standards = load_standards()
 
-if standars is None:
+if standards is None:
     st.stop()
 
 # 标题
@@ -43,8 +43,8 @@ st.title("📋 封样检验应用")
 st.markdown("---")
 
 # 显示当前标准版本
-version = standars.get("version", "未知")
-last_updated = standars.get("last_updated", "未知")
+version = standards.get("version", "未知")
+last_updated = standards.get("last_updated", "未知")
 st.info(f"📌 当前审核标准版本：V{version}（最后更新：{last_updated}）")
 
 # 侧边栏 - 审核标准设置
@@ -55,8 +55,8 @@ st.sidebar.subheader("文件完整性检查")
 
 # 获取所有检查项
 all_items = []
-if "file_completeness" in standars:
-    electronic_items = standars["file_completeness"]["electronic"]["items"]
+if "file_completeness" in standards:
+    electronic_items = standards["file_completeness"]["electronic"]["items"]
     for item in electronic_items:
         all_items.append(item["name"])
 
@@ -74,7 +74,7 @@ rohs_survey_check = st.sidebar.checkbox("检查RoHS调查表必填项", value=Tr
 
 st.sidebar.subheader("CPK检查")
 cpk_check = st.sidebar.checkbox("检查CPK值（≥1.33）", value=True)
-cpk_value = standars.get("cpk_check", {}).get("min_cpk_value", 1.33)
+cpk_value = standards.get("cpk_check", {}).get("min_cpk_value", 1.33)
 st.sidebar.caption(f"当前合格标准：CPK ≥ {cpk_value}")
 
 st.sidebar.subheader("尺寸对应性检查")
