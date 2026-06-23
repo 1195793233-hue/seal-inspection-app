@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V6.2 精准审核版
+封样检验Web应用 - V5.1 稳定优化版
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
+V5.1优化：内存管理（gc.collect）、文本截断、实时状态更新、大文件稳定性提升
 """
 
 import streamlit as st
@@ -15,6 +16,7 @@ from datetime import datetime, timedelta
 import json
 import re
 import pdfplumber
+import gc  # V5.1: 内存管理 - 显式垃圾回收
 
 # ============================================================
 # 标准文件读取
@@ -39,6 +41,7 @@ def analyze_pdf_page_by_page(pdf_path):
     """
     V4.0 步骤2：逐页分析PDF内容类型
     返回：list of dict, 每个dict代表一页的分析结果
+    V5.1优化: 限制每页文本存储长度，减少内存占用
     """
     results = []
     try:
@@ -48,10 +51,15 @@ def analyze_pdf_page_by_page(pdf_path):
                 text = page.extract_text() or ""
                 text_lower = text.lower()
 
+                # V5.1: 只保留前500字符用于后续匹配，完整文本不存入结果
+                # 完整文本在函数内使用后即释放，不再占用内存
+                text_for_storage = text[:500] if len(text) > 500 else text
+                text_lower_for_storage = text_lower[:500] if len(text_lower) > 500 else text_lower
+
                 page_info = {
                     "page_num": page_num,
-                    "text": text,
-                    "text_lower": text_lower,
+                    "text": text_for_storage,          # 截断存储
+                    "text_lower": text_lower_for_storage,  # 截断存储
                     "is_cover": False,
                     "is_engineering_drawing": False,
                     "is_bom": False,
@@ -234,13 +242,19 @@ def check_product_specification(page_analysis):
 # ============================================================
 
 def extract_all_text(pdf_path):
-    """提取PDF全部文本（合并）"""
+    """提取PDF全部文本（合并）
+    V5.1优化: 限制总文本长度为50000字符，避免超大PDF内存溢出
+    """
     text = ""
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text() or ""
                 text += page_text + "\n"
+                # V5.1: 超过限制后截断，避免内存爆炸
+                if len(text) > 50000:
+                    text = text[:50000] + "\n[... 文本过长，已截断 ...]"
+                    break
     except Exception as e:
         text = f"[PDF解析错误: {e}]"
     return text
@@ -1501,15 +1515,29 @@ with col1:
     if uploaded_files or 'folder_files' in st.session_state:
         st.subheader("📄 已选择的文件")
         count = 0
+        total_size_mb = 0
+
         if uploaded_files:
             for f in uploaded_files:
-                st.text(f"✅ {f.name}")
+                size_mb = len(f.getvalue()) / (1024 * 1024)
+                total_size_mb += size_mb
+                size_warning = " ⚠️ 大文件" if size_mb > 20 else ""
+                st.text(f"✅ {f.name} ({size_mb:.1f}MB){size_warning}")
                 count += 1
         if 'folder_files' in st.session_state:
             for fp in st.session_state['folder_files']:
+                try:
+                    total_size_mb += os.path.getsize(fp) / (1024 * 1024)
+                except OSError:
+                    pass
                 st.text(f"✅ {os.path.basename(fp)}")
                 count += 1
-        st.info(f"共 **{count}** 个文件待审核")
+
+        st.info(f"共 **{count}** 个文件待审核 | 总大小 **{total_size_mb:.1f}MB**")
+
+        # V5.1: 大文件/多文件警告
+        if total_size_mb > 50 or count > 5:
+            st.warning("⚠️ 文件较大或数量较多，建议分批处理以避免超时。单个文件超过20MB可能需要较长处理时间。")
 
         if st.button("🗑️ 清空文件列表", type="secondary"):
             if 'folder_files' in st.session_state:
@@ -1535,32 +1563,58 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件...")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.1: 优化内存管理)")
 
             progress = st.progress(0)
             detail_results = []
+            status_text = st.empty()  # V5.1: 实时状态更新容器
 
             for i, (fp, fname) in enumerate(all_paths):
-                with st.spinner(f"正在审核: {fname}"):
-                    try:
-                        res = run_full_inspection(fp, fname, standards)
-                        detail_results.append(res)
-                    except Exception as e:
-                        st.error(f"❌ 审核文件 {fname} 时出错: {e}")
-                        detail_results.append({
-                            "文件名": fname,
-                            "总体结论": f"❌ 审核异常: {str(e)[:50]}",
-                            "问题数量": 1,
-                            "_detail": {"final": {"verdict": f"❌ 异常", "suggestion": f"审核出错: {e}"}},
-                            **{k: "⏱ 异常" for k in [
-                                "文件类型","物料类型","需要电气性能测试",
-                                "文件完整性","RoHS合规性","CPK合规性",
-                                "尺寸对应性","报告时效性","目录勾选状态","料号一致性",
-                                "审核时间","标准版本"
-                            ]}
-                        })
+                # V5.1: 实时更新当前处理状态
+                status_text.info(f"📄 正在审核 [{i+1}/{len(all_paths)}]: **{fname}**")
+
+                try:
+                    res = run_full_inspection(fp, fname, standards)
+                    detail_results.append(res)
+
+                    # V5.1: 处理成功后立即释放该文件相关内存
+                    if '_detail' in res:
+                        res['_detail'].pop('page_analysis', None)  # 释放页面分析数据
+                        for key in ['completeness', 'rohs', 'cpk', 'dimension', 'validity']:
+                            if key in res['_detail']:
+                                sub = res['_detail'][key]
+                                if isinstance(sub, dict):
+                                    sub.pop('items', None)  # 释放详细项目列表
+
+                except Exception as e:
+                    error_msg = str(e)
+                    st.error(f"❌ 审核文件 {fname} 时出错: {error_msg}")
+                    detail_results.append({
+                        "文件名": fname,
+                        "总体结论": f"❌ 审核异常: {error_msg[:50]}",
+                        "问题数量": 1,
+                        "_detail": {"final": {"verdict": f"❌ 异常", "suggestion": f"审核出错: {e}"}},
+                        **{k: "⏱ 异常" for k in [
+                            "文件类型","物料类型","需要电气性能测试",
+                            "文件完整性","RoHS合规性","CPK合规性",
+                            "尺寸对应性","报告时效性","目录勾选状态","料号一致性",
+                            "审核时间","标准版本"
+                        ]}
+                    })
+
                 progress.progress((i + 1) / len(all_paths))
 
+                # V5.1: 每处理完一个文件，显式回收内存（关键优化！）
+                gc.collect()
+
+                # V5.1: 清理临时上传的PDF文件
+                if fp.startswith(tempfile.gettempdir()):
+                    try:
+                        os.unlink(fp)
+                    except OSError:
+                        pass
+
+            status_text.empty()  # 清除状态文本
             st.success(f"✅ 审核完成！共审核 **{len(detail_results)}** 个文件")
 
             # 结果汇总表格
@@ -1728,7 +1782,7 @@ st.markdown("""
 3. **开始审核** — 点击按钮，等待审核完成
 4. **查看结果** — 展开每个文件的详细信息，下载Excel/Markdown报告
 
-### ⚙️ V6.2 版本说明（与SKILL.md同步）
+### ⚙️ V5.1 版本说明（与SKILL.md同步）
 | 功能 | 状态 |
 |------|--------|
 | 文件类型检查（DQM-001 vs DQM-002） | ✅ |
@@ -1742,6 +1796,8 @@ st.markdown("""
 | 报告时效性（≤1年） | ✅ |
 | **目录勾选状态检测** | ✅ **V6.2新增** |
 | **料号&物料名称跨表一致性检查** | ✅ **V6.2新增** |
+| **内存优化（gc.collect + 文本截断）** | ✅ **V5.1新增** |
+| **大文件稳定性提升（实时状态+错误恢复）** | ✅ **V5.1新增** |
 
 > 💡 **注意：** 本工具使用PDF文本解析技术进行自动化审核，部分内容（如图片中的尺寸标注、手写签名等）可能需要人工辅助确认。
 """)
