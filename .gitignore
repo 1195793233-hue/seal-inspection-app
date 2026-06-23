@@ -1,22 +1,11 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
+*.py[cod]
+*$py.class
 *.so
-*.egg
-*.egg-info/
-dist/
-build/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+.Python
+env/
+venv/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -35,13 +24,51 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Project specific
+# Temporary files
+*.tmp
+*.temp
 *.log
-debug_output*.txt
-build/
-dist/
-*.bat
-*.exe
+streamlit_*.log
 
-# Workbuddy
-.workbuddy/
+# Excel reports (generated)
+*.xlsx
+*.xls
+
+# Debug/Test scripts (should not be tracked)
+add_hyperlinks*.py
+add_project_column.py
+audit_zhuoya*.py
+batch_audit*.py
+beautify_excel.py
+check_pdf_compliance.py
+create_hyperlinks*.py
+create_summary*.py
+debug_excel*.py
+detailed_check*.py
+dimension_check.py
+extract_*.py
+fix_hyperlinks*.py
+generate_*.py
+reaudit*.py
+remove_column.py
+seal_inspection_app*.py
+update_standard*.py
+
+# Backup files
+app_full.py
+app_real.py
+app_fixed.py
+app_diagnostic.py
+*_v2.py
+*_v3.py
+*_v4.py
+*_v5.py
+*_fixed.py
+*_final.py
+
+# Documentation (local only)
+工作记录.txt
+审核报告*.md
+审核报告*.txt
+*~*.md
+*~*.txt
