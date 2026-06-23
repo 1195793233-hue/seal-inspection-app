@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - 完整可部署版
-支持拖拽上传、批量上传、完整审核功能
+封样检验Web应用 - 读取标准文件版本
+自动读取 inspection_standards.json 中的审核标准
 """
 
 import streamlit as st
@@ -20,20 +20,52 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# 读取审核标准文件
+@st.cache_data
+def load_standards():
+    try:
+        with open("inspection_standards.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        st.error("❌ 找不到标准文件 inspection_standards.json")
+        return None
+    except Exception as e:
+        st.error(f"❌ 读取标准文件失败: {e}")
+        return None
+
+standards = load_standards()
+
+if standars is None:
+    st.stop()
+
 # 标题
 st.title("📋 封样检验应用")
 st.markdown("---")
 
+# 显示当前标准版本
+version = standars.get("version", "未知")
+last_updated = standars.get("last_updated", "未知")
+st.info(f"📌 当前审核标准版本：V{version}（最后更新：{last_updated}）")
+
 # 侧边栏 - 审核标准设置
 st.sidebar.header("⚙️ 审核标准设置")
 
+# 从标准文件动态生成选项
 st.sidebar.subheader("文件完整性检查")
+
+# 获取所有检查项
+all_items = []
+if "file_completeness" in standars:
+    electronic_items = standars["file_completeness"]["electronic"]["items"]
+    for item in electronic_items:
+        all_items.append(item["name"])
+
+# 创建多选项
+default_items = ["物料清单", "工程图纸", "全尺寸测量报告", "Cpk报告", "RoHS 2.0测试报告"]
 check_list = st.sidebar.multiselect(
     "选择要检查的项目",
-    ["封面&目录", "规格图纸", "全尺寸量测报告", "CPK报告", "RoHS 2.0测试报告", 
-     "RoHS 2.0限用物质成分调查表", "REACH调查表", "材质证明", "性能测试报告",
-     "包装规范", "BOM表", "样品照片", "承认书", "可靠性测试报告"],
-    default=["封面&目录", "规格图纸", "全尺寸量测报告", "CPK报告", "RoHS 2.0测试报告"]
+    all_items,
+    default=[item for item in all_items if item in default_items]
 )
 
 st.sidebar.subheader("RoHS检查")
@@ -42,6 +74,8 @@ rohs_survey_check = st.sidebar.checkbox("检查RoHS调查表必填项", value=Tr
 
 st.sidebar.subheader("CPK检查")
 cpk_check = st.sidebar.checkbox("检查CPK值（≥1.33）", value=True)
+cpk_value = standars.get("cpk_check", {}).get("min_cpk_value", 1.33)
+st.sidebar.caption(f"当前合格标准：CPK ≥ {cpk_value}")
 
 st.sidebar.subheader("尺寸对应性检查")
 dimension_check = st.sidebar.checkbox("检查尺寸公差对应性", value=True)
@@ -72,16 +106,16 @@ with col1:
             pdf_files = []
             for root, dirs, files in os.walk(folder_path):
                 for file in files:
-                    if file.lower().endswith('.pdf'):
+                    if file.lower().endswith(".pdf"):
                         pdf_files.append(os.path.join(root, file))
             
             if pdf_files:
-                st.success(f"找到 {len(pdf_files)} 个PDF文件")
+                st.success(f"✅ 找到 {len(pdf_files)} 个PDF文件")
                 st.session_state['folder_files'] = pdf_files
             else:
-                st.warning("该文件夹中没有找到PDF文件")
+                st.warning("⚠️ 该文件夹中没有找到PDF文件")
         else:
-            st.error("文件夹路径不存在，请检查后重试")
+            st.error("❌ 文件夹路径不存在，请检查后重试")
     
     # 显示已上传的文件
     if uploaded_files or 'folder_files' in st.session_state:
@@ -120,7 +154,7 @@ with col2:
         if not all_files:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 {len(all_files)} 个文件...")
+            st.info(f"🔍 开始审核 {len(all_files)} 个文件...")
             
             # 创建进度条
             progress_bar = st.progress(0)
@@ -134,12 +168,13 @@ with col2:
                 # 暂时使用模拟结果
                 result = {
                     '文件名': file_name,
-                    '文件完整性': '✅ 通过' if '封面&目录' in check_list else '⚠️ 部分通过',
+                    '文件完整性': '✅ 通过' if '物料清单' in check_list else '⚠️ 部分通过',
                     'RoHS检查': '✅ 通过' if rohs_check else '⏭️ 未检查',
                     'CPK检查': '✅ 通过' if cpk_check else '⏭️ 未检查',
                     '尺寸对应性': '✅ 通过' if dimension_check else '⏭️ 未检查',
                     '总体结果': '✅ 通过',
-                    '审核时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    '审核时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    '标准版本': f"V{version}"
                 }
                 results.append(result)
                 
@@ -165,23 +200,24 @@ with col2:
                     st.download_button(
                         label="📥 下载Excel报告",
                         data=f,
-                        file_name=f"封样审核报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        file_name=f"封样审核报告_V{version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
             
             with col_dl2:
                 # 下载文本报告
-                report_text = "封样审核报告\n" + "="*50 + "\n\n"
+                report_text = f"封样审核报告（标准版本：V{version}）\n" + "="*50 + "\n\n"
                 for result in results:
                     report_text += f"文件名: {result['文件名']}\n"
                     report_text += f"总体结果: {result['总体结果']}\n"
                     report_text += f"审核时间: {result['审核时间']}\n"
+                    report_text += f"标准版本: {result['标准版本']}\n"
                     report_text += "-"*50 + "\n"
                 
                 st.download_button(
                     label="📥 下载文本报告",
                     data=report_text,
-                    file_name=f"封样审核报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    file_name=f"封样审核报告_V{version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                     mime="text/plain"
                 )
             
@@ -195,8 +231,10 @@ with col2:
 
 # 底部说明
 st.markdown("---")
-st.markdown("""
+st.markdown(f"""
 ### 📝 使用说明
+
+**当前使用的审核标准：** V{version}（{last_updated}更新）
 
 1. **上传文件**：支持拖拽上传或点击选择多个PDF文件
 2. **设置标准**：在左侧边栏选择要检查的审核标准
@@ -207,14 +245,14 @@ st.markdown("""
 
 - **文件完整性检查**：检查PDF是否包含必要的文档（如封面、规格图纸等）
 - **RoHS检查**：检查RoHS报告日期是否在1年内，调查表是否填写完整
-- **CPK检查**：检查CPK值是否≥1.33
+- **CPK检查**：检查CPK值是否≥{cpk_value}
 - **尺寸对应性检查**：检查规格图纸、全尺寸量测报告、CPK报告中的尺寸是否对应
 
 ### 💡 提示
 
-- 首次上传文件可能需要几秒钟处理时间，请耐心等待
-- 审核大型PDF文件时，进度条会显示当前进度
-- 可以随时点击"清空文件列表"重新选择文件
+- 审核标准存储在 `inspection_standards.json` 文件中
+- 更新标准时，只需修改该JSON文件并推送到GitHub
+- Streamlit Cloud会自动重新部署，使用最新标准
 """)
 
 # 隐藏Streamlit默认样式
