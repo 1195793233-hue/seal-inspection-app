@@ -107,9 +107,27 @@ def analyze_pdf_page_by_page(pdf_path):
                 if "附上样品实物" in text or "sample photo" in text_lower or "样品照片" in text:
                     page_info["is_sample_photo"] = True
 
-                # --- CPK报告页判定 ---
-                if re.search(r'cp[kk]\s*[:：=]', text_lower) or "cpk报告" in text_lower or "cpk report" in text_lower:
-                    page_info["is_cpk"] = True
+                # --- CPK报告页判定（V6.1 增强：支持表格形式/繁体中文/多种格式）---
+                cpk_indicators = [
+                    r'cp[kK]\s*[:：=]',                    # cpk: / cpk= / cpk：
+                    r'cp[kK]\s*報告',                      # 繁体 CPK報告
+                    r'cp[kK]\s*报告',                      # 简体 CPK报告
+                    r'cp[kK]\s*report',                   # CPK report
+                    r'cp[kK]\s*值',                        # CPK值
+                    r'cp[kK]\s*[\(（].*?[\)）]',          # CPK(xxx)
+                    r'^.*cp[kK].*$',                       # 任意含CPK的行（宽泛匹配）
+                ]
+                # 宽松匹配：页面文本中只要包含 CPK/Cpk 关键词即判定
+                if re.search(r'cp[kK]', text_lower):
+                    # 进一步确认不是偶然出现（至少出现2次或有相关统计关键词）
+                    cpk_count = len(re.findall(r'cp[kK]', text_lower))
+                    has_cpk_context = any(kw in text_lower for kw in [
+                        'usl', 'lsl', 'ppk', 'stddev', 'average', 'range',
+                        '规格上限', '规格下限', '标准差', '平均值', '量測', '测量',
+                        'dimension', 'tolerance', 'nominal', 'specification'
+                    ])
+                    if cpk_count >= 2 or has_cpk_context:
+                        page_info["is_cpk"] = True
 
                 # --- RoHS调查表页判定 ---
                 if "rohs" in text_lower and ("调查表" in text or "survey" in text_lower):
@@ -260,25 +278,134 @@ def extract_dates_from_text(text):
     return dates
 
 
-def extract_cpk_values(text):
-    """从文本中提取CPK值"""
+def extract_cpk_values(text, pdf_path=None):
+    """
+    V6.1 增强：从文本和表格中提取CPK值
+    支持多种格式：
+    1. 文本键值对：cpk: 1.33 / cpk=1.33
+    2. 表格形式：CPK列头 + 数值行（pdfplumber extract_tables）
+    3. 统计行格式：... | CPK | 0.67 | 3.84 | ...
+    4. 宽松相邻匹配：CPK/Cpk 紧邻数字
+    """
     cpk_values = []
-    patterns = [
-        r'cpk\s*[:：=]\s*(\d+\.?\d*)',
-        r'cpk\s*[\(（]\s*(\d+\.?\d*)',
-        r'cpk\s+value\s*[:：=]\s*(\d+\.?\d*)',
-        r'cp\s*[kK]\s*[:：=]\s*(\d+\.?\d*)',
+    seen = set()
+
+    def add_val(v):
+        """去重添加CPK值"""
+        if v not in seen and 0 <= v <= 100:  # 合理的CPK范围
+            seen.add(v)
+            cpk_values.append(v)
+
+    # ===== 方法1：文本正则匹配（原有逻辑 + 扩展）=====
+    text_patterns = [
+        r'cpk\s*[:：=]\s*(\d+\.?\d*)',           # cpk: 1.33
+        r'cpk\s*[\(（]\s*(\d+\.?\d*)',           # cpk(1.33)
+        r'cpk\s+value\s*[:：=]\s*(\d+\.?\d*)',   # cpk value: 1.33
+        r'cp\s*[kK]\s*[:：=]\s*(\d+\.?\d*)',     # CP : 1.33
+        r'c pk\s*[:：=]\s*(\d+\.?\d*)',          # c pk: 1.33 (可能的空格)
+        # V6.1 新增：宽松相邻匹配
+        r'cp[kK]\s*[\/>]?\s*(\d+\.\d{1,2})',     # CPK>1.33 / CPK/1.33 / CPK 1.33
+        r'cp[kK]\s+(?:最小|min|minimum)?\s*[:：]?\s*(\d+\.\d+)',  # CPK最小: 1.33
+        r'(?:cpk|Cpk|CPK)\s.*?(\d+\.\d{2})',      # CPK xxx 1.33（同一行内）
     ]
-    for pattern in patterns:
+    for pattern in text_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
         for val in matches:
             try:
-                cpk_values.append(float(val))
+                add_val(float(val))
             except ValueError:
                 continue
-    # 也尝试从表格中提取
-    cpk_table_pattern = r'(\d+\.\d+)\s*[≥>=]\s*1\.33|1\.33\s*[≤<=]\s*(\d+\.\d+)'
-    return list(set(cpk_values))
+
+    # ===== 方法2：从PDF表格中提取CPK值（V6.1 核心新增）=====
+    if pdf_path:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    tables = page.extract_tables()
+                    if not tables:
+                        continue
+                    for table in tables:
+                        if not table or len(table) < 2:
+                            continue
+                        # 寻找包含 CPK 的表头行
+                        for row_idx, row in enumerate(table):
+                            if row is None:
+                                continue
+                            # 将row中所有单元格转为字符串
+                            row_strs = [str(c).strip() if c else "" for c in row]
+                            row_text_lower = " ".join(row_strs).lower()
+
+                            # 检查此行是否含CPK相关表头
+                            if re.search(r'cp[kK]', row_text_lower):
+                                # 找到CPK列的索引
+                                cpk_col_indices = []
+                                for col_idx, cell in enumerate(row_strs):
+                                    if re.search(r'cp[kK]', cell.lower()):
+                                        cpk_col_indices.append(col_idx)
+
+                                # 如果找到了CPK列，从后续数据行中取值
+                                if cpk_col_indices:
+                                    # 查看后续数据行（最多往后查10行）
+                                    for data_row_idx in range(row_idx + 1, min(row_idx + 11, len(table))):
+                                        data_row = table[data_row_idx]
+                                        if data_row is None:
+                                            continue
+                                        for col_idx in cpk_col_indices:
+                                            cell_val = data_row[col_idx] if col_idx < len(data_row) else None
+                                            if cell_val is not None:
+                                                val_str = str(cell_val).strip()
+                                                # 提取数字
+                                                num_match = re.match(r'^(\d+\.?\d*)$', val_str)
+                                                if num_match:
+                                                    try:
+                                                        add_val(float(num_match.group(1)))
+                                                    except ValueError:
+                                                        pass
+                                                # 也尝试更宽松的提取
+                                                elif re.search(r'\d+\.\d{1,2}', val_str):
+                                                    nums = re.findall(r'\d+\.\d{1,2}', val_str)
+                                                    for n in nums:
+                                                        try:
+                                                            add_val(float(n))
+                                                        except ValueError:
+                                                            pass
+                                    break  # 只处理第一个含CPK的表头行
+
+                        # 额外：扫描整个表格中的CPK数值模式
+                        # 有些PDF的表格结构不规则，直接搜索所有单元格
+                        for row in table:
+                            if row is None:
+                                continue
+                            for cell in row:
+                                if cell is None:
+                                    continue
+                                cell_str = str(cell).strip()
+                                # 匹配如 "CPK=0.67" 或 "Cpk: 3.84" 格式的单元格
+                                m = re.search(r'cp[kK]\s*[:：=]?\s*(\d+\.?\d*)', cell_str, re.IGNORECASE)
+                                if m:
+                                    try:
+                                        add_val(float(m.group(1)))
+                                    except ValueError:
+                                        pass
+        except Exception:
+            pass  # 表格提取失败时静默跳过，不影响主流程
+
+    # ===== 方法3：多行统计摘要匹配 =====
+    # 匹配类似 "CPK  0.67  3.84  4.00" 这种同行多值格式
+    multi_cpk_pattern = r'cp[kK][\s\:：]*([0-9.]+(?:\s+[0-9.]+)*)'
+    multi_matches = re.findall(multi_cpk_pattern, text, re.IGNORECASE)
+    for match_group in multi_matches:
+        numbers = re.findall(r'(\d+\.\d{1,2})', match_group)
+        for n in numbers:
+            try:
+                v = float(n)
+                # 过滤掉明显不是CPK值的数（如尺寸值>100或过小的噪声值<0.01）
+                if 0.01 <= v <= 20:
+                    add_val(v)
+            except ValueError:
+                continue
+
+    return cpk_values
 
 
 def check_keyword_in_text(text, keywords):
@@ -508,9 +635,10 @@ def inspect_rohs_compliance(page_analysis, standards, check_date):
     return results
 
 
-def inspect_cpk_compliance(page_analysis, standards, pdf_text):
+def inspect_cpk_compliance(page_analysis, standards, pdf_text, pdf_path=None):
     """
     第三类：CPK合规性检验（2子项）
+    V6.1: 支持从PDF表格中提取CPK值
     """
     results = {
         "sub_items": {},
@@ -521,8 +649,8 @@ def inspect_cpk_compliance(page_analysis, standards, pdf_text):
 
     all_text = " ".join(p.get("text", "") for p in page_analysis)
 
-    # 3.1 提取CPK值
-    cpk_values = extract_cpk_values(all_text)
+    # 3.1 提取CPK值（V6.1: 传入pdf_path以支持表格解析）
+    cpk_values = extract_cpk_values(all_text, pdf_path=pdf_path)
     results["cpk_values"] = cpk_values
 
     if cpk_values:
@@ -722,7 +850,7 @@ def run_full_inspection(file_path, file_name, standards):
     # 第二步~第五步：各类检验（基于逐页分析结果）
     completeness = inspect_file_completeness_v4(page_analysis, mat_type, standards)
     rohs = inspect_rohs_compliance(page_analysis, standards, check_date)
-    cpk = inspect_cpk_compliance(page_analysis, standards, all_text)
+    cpk = inspect_cpk_compliance(page_analysis, standards, all_text, pdf_path=file_path)
     dimension = inspect_dimension_correspondence(page_analysis, standards)
     validity = inspect_report_validity(page_analysis, standards, check_date)
 
