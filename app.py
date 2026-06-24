@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.6 检测精度增强版
+封样检验Web应用 - V5.8 出错复位版
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -33,6 +33,63 @@ def load_standards():
         return None
     except Exception as e:
         return None
+
+# ============================================================
+# V5.7 新增：物料编码规则加载
+# ============================================================
+
+@st.cache_data(ttl=600)
+def load_material_coding_rules():
+    """读取物料编码规则JSON文件（由物料编码规则.xlsx生成）"""
+    try:
+        with open("material_coding_rules.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+def identify_material_type(part_number, coding_rules):
+    """
+    V5.7新增：根据料号识别物料类型（结构料/电子料）及小类信息
+    参数:
+        part_number: 料号字符串（如 K6970000223LA）
+        coding_rules: load_material_coding_rules() 返回的字典
+    返回:
+        dict: {"成功": bool, "类型": "结构料/电子料", "小类": "...", "小小类": "...", "详情": "..."}
+    """
+    result = {"成功": False, "类型": "未知", "小类": "", "小小类": "", "详情": ""}
+
+    if not part_number or not coding_rules:
+        result["详情"] = "料号或编码规则为空"
+        return result
+
+    # 提取前5位：字母 + 4位数字（如 K6970）
+    m = re.match(r'([A-Za-z])(\d{4})', part_number)
+    if not m:
+        result["详情"] = f"料号格式无法识别（期望字母+4位数字开头，实际：{part_number[:8]})"
+        return result
+
+    prefix = m.group(1).upper()  # K 或 R
+    code_4 = prefix + m.group(2)  # 如 K6970
+
+    if prefix not in coding_rules:
+        result["详情"] = f"未知前缀：{prefix}（期望 K 或 R）"
+        return result
+
+    if code_4 in coding_rules[prefix]:
+        info = coding_rules[prefix][code_4]
+        result["成功"] = True
+        result["类型"] = info.get("类型", "未知")
+        result["小类"] = info.get("小类", "")
+        result["小小类"] = info.get("小小类", "")
+        result["详情"] = f"{result['类型']} / {info.get('小类', '')} / {info.get('小小类', '')}"
+    else:
+        # 4位代码未找到，返回大类信息
+        result["类型"] = "结构料" if prefix == "K" else "电子料"
+        result["详情"] = f"{result['类型']}（{code_4} 未在编码规则中找到对应小类，已按前缀判断）"
+
+    return result
 
 # ============================================================
 # V4.0 新增：PDF逐页分析引擎
@@ -702,6 +759,10 @@ def inspect_rohs_compliance(page_analysis, standards, check_date):
         "rohs 2.0 test report",  # 大小写变体
         "restricted substances composition",  # 英文调查表标题
         "sgs", "test report",  # SGS测试报告标识
+        # V5.7新增：文件名形式和更多变体
+        "rohs.pdf", "rohs .pdf", "限用物质成分调查表",
+        "rohs 2.0 questionnaire", "rohs composition",
+        "material certificate", "材质证明", "sgs报告",
     ]
     rohs_report_found = any(kw in all_text_lower for kw in rohs_keywords)
 
@@ -753,12 +814,26 @@ def inspect_rohs_compliance(page_analysis, standards, check_date):
         found = False
         for p in rohs_survey_pages:
             txt = p.get("text", "")
+            # V5.7：使用更宽松的子串匹配（关键词只需出现在文本中任意位置）
             if any(kw.lower() in txt.lower() for kw in keywords):
                 found = True
                 break
         if not found:
-            # 在全文中再查一次
-            if not any(kw.lower() in all_text_lower for kw in keywords):
+            # V5.7：在全文中再查一次，且使用拆分词匹配
+            for kw in keywords:
+                # 拆分多词关键词为单词级别匹配
+                kw_words = kw.lower().split()
+                if len(kw_words) >= 2:
+                    # 多词关键词：每个词都需要出现（允许中间有其他文字）
+                    all_words_found = all(w in all_text_lower for w in kw_words if len(w) > 1)
+                    if all_words_found:
+                        found = True
+                        break
+                else:
+                    if kw.lower() in all_text_lower:
+                        found = True
+                        break
+            if not found:
                 missing_fields.append(field_name.split("（")[0])
 
     fill_status = f"✅ 全部填写（{6 - len(missing_fields)}/6）" if len(missing_fields) == 0 else f"❌ {len(missing_fields)}项未填写：{'、'.join(missing_fields)}"
@@ -917,9 +992,10 @@ def inspect_report_validity(page_analysis, standards, check_date):
 # V6.2 新增：目录勾选状态检测 + 料号&物料名称跨表一致性检查
 # ============================================================
 
-def extract_cover_info(page_analysis, pdf_path):
+def extract_cover_info(page_analysis, pdf_path, tables=None):
     """
     V6.2: 从封面/样品承认书页提取料号和物料名称
+    V5.7增强：当封面页为图片(无文字)时，从前几页表格中回退搜索料号
     返回: {"part_number": str, "material_name": str, "page_num": int}
     """
     result = {"part_number": "", "material_name": "", "page_num": 0}
@@ -975,6 +1051,42 @@ def extract_cover_info(page_analysis, pdf_path):
 
         if result["part_number"] or result["material_name"]:
             break
+
+    # V5.7增强：封面页为图片(无文字)时，从前10页表格中搜索料号
+    if not result["part_number"] and tables:
+        import re as _re
+        for t_dict in tables:
+            tbl_page = t_dict.get("page", 0)
+            if tbl_page > 10:  # 只搜索前10页
+                continue
+            tbl = t_dict.get("table", [])
+            if not tbl:
+                continue
+            # 在表格中搜索 K+数字 字母格式（如 K6970000223LA）
+            for row in tbl:
+                if not row:
+                    continue
+                for cell in row:
+                    if cell is None:
+                        continue
+                    cell_str = str(cell).strip()
+                    pn_match = _re.search(r'(K\d+[A-Za-z]*)', cell_str)
+                    if pn_match and not result["part_number"]:
+                        result["part_number"] = pn_match.group(1).strip()
+                        result["page_num"] = tbl_page
+                    # 同时尝试提取物料名称
+                    name_patterns = [
+                        r'(?:Part Name|零件名称|产品名称|Description)[^:\w]*[\s:：]*([A-Za-z0-9\-一-鿿]+)',
+                    ]
+                    for npat in name_patterns:
+                        nm = _re.search(npat, cell_str, _re.IGNORECASE)
+                        if nm and len(nm.group(1)) >= 3 and not result["material_name"]:
+                            result["material_name"] = nm.group(1).strip()
+
+                if result["part_number"]:
+                    break
+            if result["part_number"]:
+                break
 
     return result
 
@@ -1211,18 +1323,39 @@ def check_catalog_checkboxes(pdf_path, page_analysis, tables=None):  # V5.5: 接
                     result["unchecked_count"] = _t_unchecked
                     result["total_items"] = _t_checked + _t_unchecked
                     _catalog_from_table = True
+                    
+                    # V5.7增强：检查是否存在任何checkbox标记字符
+                    # 如果完全没有任何checkbox标记（☑/☐/✓/□等），说明这是普通列表式目录而非勾选式
+                    _has_any_checkbox = False
+                    for row in tbl[1:]:
+                        if not row:
+                            continue
+                        row_text = " ".join(str(c) if c else "" for c in row)
+                        _chk_chars = ['☑', '☐', '✓', '✔', '✅', '❏', '√', '[x]', '[X]', '[ ]', '(x)', '( )']
+                        if any(ch in row_text for ch in _chk_chars):
+                            _has_any_checkbox = True
+                            break
+                    
                     # 直接跳转到结果判定
-                    if _t_unchecked == 0 and _t_checked > 0:
-                        result["status"] = "✅ 全部已勾选"
-                        result["details"] = f"目录共{_t_checked}项，全部已勾选（表格检测）"
-                    elif _t_unchecked == result["total_items"]:
-                        result["status"] = "❌ NG - 目录全部未勾选"
-                        result["details"] = f"目录共{result['total_items']}项，**全部未勾选**（第{result['catalog_page_num']}页）"
-                        result["issues"].append(f"目录页（第{result['catalog_page_num']}页）：{result['total_items']}项全部未勾选")
-                    elif _t_unchecked > 0:
-                        result["status"] = f"⚠️ 部分未勾选（{_t_unchecked}/{result['total_items']}）"
-                        result["details"] = f"目录共{result['total_items']}项，已勾选{_t_checked}项，未勾选{_t_unchecked}项"
-                        result["issues"].append(f"目录页有{_t_unchecked}项未勾选")
+                    if _has_any_checkbox:
+                        # 有checkbox标记：按实际勾选状态判断
+                        if _t_unchecked == 0 and _t_checked > 0:
+                            result["status"] = "✅ 全部已勾选"
+                            result["details"] = f"目录共{_t_checked}项，全部已勾选（表格检测）"
+                        elif _t_unchecked == result["total_items"]:
+                            result["status"] = "❌ NG - 目录全部未勾选"
+                            result["details"] = f"目录共{result['total_items']}项，**全部未勾选**（第{result['catalog_page_num']}页）"
+                            result["issues"].append(f"目录页（第{result['catalog_page_num']}页）：{result['total_items']}项全部未勾选")
+                        elif _t_unchecked > 0:
+                            result["status"] = f"⚠️ 部分未勾选（{_t_unchecked}/{result['total_items']}）"
+                            result["details"] = f"目录共{result['total_items']}项，已勾选{_t_checked}项，未勾选{_t_unchecked}项"
+                            result["issues"].append(f"目录页有{_t_unchecked}项未勾选")
+                    else:
+                        # V5.7：无checkbox标记 → 判定为目录已提供（列表式目录）
+                        result["status"] = "✅ 目录已提供"
+                        result["details"] = f"目录共{result['total_items']}项（列表式目录，无勾选标记框）"
+                        result["checked_count"] = result["total_items"]  # 视为全部有效
+                        result["unchecked_count"] = 0
                     return result
 
     # 方法1：通过文本特征判断勾选状态
@@ -1346,7 +1479,7 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4
     }
 
     # Step 1: 提取封面的料号和物料名称
-    cover = extract_cover_info(page_analysis, pdf_path)
+    cover = extract_cover_info(page_analysis, pdf_path, tables=tables)
     result["cover_info"] = cover
 
     if not cover["part_number"] and not cover["material_name"]:
@@ -1558,6 +1691,24 @@ def run_full_inspection(file_path, file_name, standards):
     catalog_check = check_catalog_checkboxes(file_path, page_analysis, tables=tables)  # V5.5: 传入预提取表格
     part_consistency = check_part_number_consistency(page_analysis, file_path, tables=tables)  # V5.4: 传入预提取表格
 
+    # V5.7 新增：根据料号识别物料类型（基于物料编码规则）
+    _coding_rules = load_material_coding_rules()
+    _mat_type_detail = mat_type_cn  # 默认使用原来的识别结果
+    if _coding_rules:
+        _pn = part_consistency.get("cover_info", {}).get("part_number", "")
+        if not _pn:
+            # 如果封面没提取到，尝试从文件名提取
+            _pn_match = re.search(r"[A-Za-z]\d{4}\d+[A-Za-z]*", file_name)
+            if _pn_match:
+                _pn = _pn_match.group(1)
+        if _pn:
+            _mat_info = identify_material_type(_pn, _coding_rules)
+            if _mat_info["成功"]:
+                _mat_type_detail = _mat_info["详情"]
+            else:
+                _mat_type_detail = f"{mat_type_cn}（编码规则：{_mat_info['详情']}）"
+
+
     # 第六步：生成最终结论
     all_results = {
         "completeness": completeness,
@@ -1574,7 +1725,7 @@ def run_full_inspection(file_path, file_name, standards):
     result = {
         "文件名": file_name,
         "文件类型": file_type_note,
-        "物料类型": f"{mat_type_cn}" if mat_type != "unknown" else "未知（需人工确认）",
+        "物料类型": _mat_type_detail if "_mat_type_detail" in dir() else (f"{mat_type_cn}" if mat_type != "unknown" else "未知（需人工确认）"),
         "需要电气性能测试": "是" if needs_elec else "否",
         "文件完整性": completeness["status"],
         "RoHS合规性": rohs["overall_status"],
@@ -1591,7 +1742,7 @@ def run_full_inspection(file_path, file_name, standards):
         "标准版本": f"V{version}",
         "_detail": {
             "mat_type": mat_type,
-            "mat_type_cn": mat_type_cn,
+            "mat_type_cn": _mat_type_detail if "_mat_type_detail" in dir() else mat_type_cn,
             "needs_elec": needs_elec,
             "file_type": file_type,
             "file_type_note": file_type_note,
@@ -1634,6 +1785,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+
+
+# ============================================================
+# V5.8 出错复位机制 - Session State 初始化
+# ============================================================
+if "app_error" not in st.session_state:
+    st.session_state["app_error"] = None
+if "inspection_running" not in st.session_state:
+    st.session_state["inspection_running"] = False
+
 # 加载标准
 standards = load_standards()
 if standards is None:
@@ -1673,6 +1834,22 @@ validity_check = st.sidebar.checkbox("✅ 报告时效性检验（≤1年）", v
 # V6.2 新增
 catalog_check = st.sidebar.checkbox("✅ 目录勾选状态检测（V6.2）", value=True)
 part_check = st.sidebar.checkbox("✅ 料号&物料名称跨表一致性（V6.2）", value=True)
+
+# ============================================================
+# V5.8 复位按钮
+# ============================================================
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 重置应用", type="secondary", use_container_width=True, help="清除所有会话状态，重新开始"):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
+
+if st.session_state.get("app_error"):
+    st.sidebar.error("⚠️ 上次运行出错")
+    if st.sidebar.button("🚨 清除错误状态", type="secondary"):
+        st.session_state["app_error"] = None
+        st.rerun()
+
 
 min_cpk_display = 1.33
 st.sidebar.info(f"当前CPK合格标准：≥{min_cpk_display}")
@@ -1744,12 +1921,34 @@ with col1:
                 del st.session_state['folder_files']
             st.rerun()
 
+# ============================================================
+# V5.8 错误状态检查 - 如果之前出错，显示友好错误页
+# ============================================================
+_app_error = st.session_state.get("app_error")
+if _app_error:
+    st.error("❌ 应用运行出错")
+    with st.expander("查看错误详情", expanded=False):
+        st.code(_app_error[:3000], language="text")
+    col_reset1, col_reset2 = st.columns(2)
+    with col_reset1:
+        if st.button("🔄 重置应用并重新开始", type="primary", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+    with col_reset2:
+        if st.button("📋 复制错误信息", type="secondary", use_container_width=True):
+            st.code(_app_error[:500], language="text")
+            st.info("请复制上方错误信息并联系开发者")
+    st.stop()
+
 with col2:
     st.header("📊 审核结果")
 
     run_btn = st.button("🚀 开始审核", type="primary", use_container_width=True)
 
     if run_btn:
+
+
         all_paths = []
         if uploaded_files:
             seen_names = set()  # V5.3: 去重用
@@ -1775,7 +1974,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.6: 检测精度增强)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8: 增加出错复位机制)")
 
             progress = st.progress(0)
             detail_results = []
@@ -1802,6 +2001,9 @@ with col2:
                     import traceback
                     error_msg = str(e)
                     st.error(f"❌ 审核文件 {fname} 时出错: {error_msg}")
+                    # V5.8: 记录错误状态，供复位机制使用
+                    if not st.session_state.get("app_error"):
+                        st.session_state["app_error"] = f"文件审核异常({type(e).__name__}): {error_msg}\n{fname}"
                     # V5.3: 补全_detail所有字段，避免后续展示时KeyError
                     detail_results.append({
                         "文件名": fname,
@@ -2151,50 +2353,5 @@ with col2:
                         os.unlink(fp)
                     except OSError:
                         pass
-
-# 底部说明
-st.markdown("---")
-st.markdown("""
-### 📝 使用说明
-1. **上传PDF** — 拖拽或点击批量上传，也可输入文件夹路径批量扫描
-2. **选择标准** — 左侧边栏勾选要执行的审核项
-3. **开始审核** — 点击按钮，等待审核完成
-4. **查看结果** — 展开每个文件的详细信息，下载Excel/Markdown报告
-
-### ⚙️ V5.6 版本说明（与SKILL.md同步）
-| 功能 | 状态 |
-|------|--------|
-| 文件类型检查（DQM-001 vs DQM-002） | ✅ |
-| PDF逐页结构分析 | ✅ |
-| 工程图纸判定规则（图号/版本/尺寸标注/标题栏） | ✅ |
-| 产品规格书判定规则（嵌入工程图纸的情况） | ✅ |
-| 电子料/结构件区分审核 | ✅ |
-| RoHS合规（4子项，含红框6字段） | ✅ |
-| CPK合规（2子项，≥1.33，支持表格提取） | ✅ |
-| 尺寸对应性（包含关系C⊆B⊆A） | ✅ |
-| 报告时效性（≤1年） | ✅ |
-| **目录勾选状态检测** | ✅ **V6.2新增** |
-| **料号&物料名称跨表一致性检查** | ✅ **V6.2新增** |
-| **内存优化（gc.collect + 文本截断）** | ✅ **V5.1新增** |
-| **大文件稳定性提升（实时状态+错误恢复）** | ✅ **V5.1新增** |
-| **速度优化（PDF只打开一次，避免重复解析）** | ✅ **V5.2新增** |
-| **KeyError崩溃防护（安全访问所有_detail字段）** | ✅ **V5.3新增** |
-| **Excel错误汇总sheet（红/黄标识+建议操作）** | ✅ **V5.3新增** |
-| **单页解析异常隔离（一页失败不影响其他页）** | ✅ **V5.3新增** |
-| **文件上传去重（同名文件自动跳过）** | ✅ **V5.3新增** |
-| **彻底消除重复PDF打开（从5次→1次）** | ✅ **V5.4新增** |
-| **表格提取智能过滤（仅前30页+关键词页+限200行）** | ✅ **V5.4新增** |
-| **pdfplumber内存参数优化（关闭竖排检测）** | ✅ **V5.4新增** |
-| **目录表格检测修复（支持表格形式目录勾选识别）** | ✅ **V5.5新增** |
-| **物料类型智能识别（基于PDF内容辅助判定电子料/结构件）** | ✅ **V5.5新增** |
-| **CPK行标签格式检测（Cpk行右侧数值读取）** | ✅ **V5.6新增** |
-| **RoHS报告检测增强（扩展关键词+SGS识别+页面标记）** | ✅ **V5.6新增** |
-| **日期格式扩展（英文月份+中文日期+短格式）** | ✅ **V5.6新增** |
-| **前3页文本完整保留（封面信息不截断）** | ✅ **V5.6新增** |
-| **料号正则增强（支持K开头料号格式）** | ✅ **V5.6新增** |
-
-> 💡 **注意：** 本工具使用PDF文本解析技术进行自动化审核，部分内容（如图片中的尺寸标注、手写签名等）可能需要人工辅助确认。
-""")
-
 hide_style = "<style>#MainMenu {visibility: hidden;} footer {visibility: hidden;}</style>"
 st.markdown(hide_style, unsafe_allow_html=True)
