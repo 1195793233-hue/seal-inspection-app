@@ -1,14 +1,110 @@
 {
-  "version": "5.0",
-  "last_updated": "2026-06-23",
+  "version": "5.8.2",
+  "last_updated": "2026-06-24",
   "template_reference": "XC-R-0802-DQM-002物料正式样品承认书模板 Rev D1 20260509",
   "material_types": {
     "electronic": {
-      "keywords": ["屏", "显示屏", "屏幕", "LCD", "OLED", "Display", "扫码头", "扫描器", "Scanner", "扫码器", "听筒", "受话器", "Receiver", "Earpiece", "马达", "电机", "Motor", "Vibrator", "风扇", "散热器", "Fan", "Cooling", "扬声器", "喇叭", "Speaker", "刷卡头", "读卡器", "Card Reader", "PCB", "PCBA", "电路板", "芯片", "IC", "传感器", "模块", "模组", "电池", "电芯", "数据线", "cable", "线材", "连接器", "Connector"],
-      "required_electrical_test": ["屏", "显示屏", "屏幕", "LCD", "OLED", "Display", "扫码头", "扫描器", "Scanner", "扫码器", "听筒", "受话器", "Receiver", "Earpiece", "马达", "电机", "Motor", "Vibrator", "风扇", "散热器", "Fan", "Cooling", "扬声器", "喇叭", "Speaker", "刷卡头", "读卡器", "Card Reader", "数据线", "cable", "Cable", "线材", "连接线"]
+      "keywords": [
+        "屏",
+        "显示屏",
+        "屏幕",
+        "LCD",
+        "OLED",
+        "Display",
+        "扫码头",
+        "扫描器",
+        "Scanner",
+        "扫码器",
+        "听筒",
+        "受话器",
+        "Receiver",
+        "Earpiece",
+        "马达",
+        "电机",
+        "Motor",
+        "Vibrator",
+        "风扇",
+        "散热器",
+        "Fan",
+        "Cooling",
+        "扬声器",
+        "喇叭",
+        "Speaker",
+        "刷卡头",
+        "读卡器",
+        "Card Reader",
+        "PCB",
+        "PCBA",
+        "电路板",
+        "芯片",
+        "IC",
+        "传感器",
+        "模块",
+        "模组",
+        "电池",
+        "电芯",
+        "数据线",
+        "cable",
+        "线材",
+        "连接器",
+        "Connector"
+      ],
+      "required_electrical_test": [
+        "屏",
+        "显示屏",
+        "屏幕",
+        "LCD",
+        "OLED",
+        "Display",
+        "扫码头",
+        "扫描器",
+        "Scanner",
+        "扫码器",
+        "听筒",
+        "受话器",
+        "Receiver",
+        "Earpiece",
+        "马达",
+        "电机",
+        "Motor",
+        "Vibrator",
+        "风扇",
+        "散热器",
+        "Fan",
+        "Cooling",
+        "扬声器",
+        "喇叭",
+        "Speaker",
+        "刷卡头",
+        "读卡器",
+        "Card Reader",
+        "数据线",
+        "cable",
+        "Cable",
+        "线材",
+        "连接线"
+      ]
     },
     "structural": {
-      "keywords": ["外壳", "支架", "盖板", "装饰件", "按键", "硅胶", "橡胶", "泡棉", "胶带", "标签", "包装", "纸盒", "吸塑", "五金", "螺丝", "螺母", "弹片"]
+      "keywords": [
+        "外壳",
+        "支架",
+        "盖板",
+        "装饰件",
+        "按键",
+        "硅胶",
+        "橡胶",
+        "泡棉",
+        "胶带",
+        "标签",
+        "包装",
+        "纸盒",
+        "吸塑",
+        "五金",
+        "螺丝",
+        "螺母",
+        "弹片"
+      ]
     }
   },
   "file_type_check": {
@@ -24,66 +120,274 @@
     "electronic": {
       "total_items": 16,
       "items": [
-        {"id": 1, "name": "物料清单", "english": "Bill of Material", "required": true},
-        {"id": 2, "name": "工程图纸", "english": "Engineering Drawings", "required": true, "note": "见工程图纸特殊判定规则"},
-        {"id": 3, "name": "样品照片", "english": "Sample Photos", "required": true},
-        {"id": 4, "name": "全尺寸测量报告", "english": "Full Size Measurement Report", "required": true, "note": "必须与图纸尺寸对应"},
-        {"id": 5, "name": "Cpk报告", "english": "Cpk Report", "required": true, "note": "CPK必须≥1.33，需与图纸/全尺寸报告对应"},
-        {"id": 6, "name": "产品规格书", "english": "Product Specifications", "required": true, "note": "见产品规格书判定规则"},
-        {"id": 7, "name": "制造流程图", "english": "Process Flow Chart", "required": true},
-        {"id": 8, "name": "包装方式", "english": "Packaging Method", "required": true},
-        {"id": 9, "name": "QC工程图", "english": "QC Flow Chart", "required": true},
-        {"id": 10, "name": "电气性能测试报告", "english": "Electrical Performance Test Report", "required": "conditional", "note": "按0.2节判定是否必填"},
-        {"id": 11, "name": "可靠性测试报告", "english": "Reliability Test Report", "required": true},
-        {"id": 12, "name": "材质证明", "english": "Material Certificate / SGS Report", "required": true},
-        {"id": 13, "name": "RoHS 2.0限用物质成分调查表", "english": "RoHS 2.0 Substance Survey", "required": true, "note": "报告日期需≤1年，红框字段必填"},
-        {"id": 14, "name": "RoHS 2.0测试报告", "english": "RoHS 2.0 Test Report", "required": true, "note": "接受第三方报告"},
-        {"id": 15, "name": "REACH物质成分调查表", "english": "REACH Substance Survey", "required": true},
-        {"id": 16, "name": "REACH测试报告", "english": "REACH Test Report", "required": true, "note": "接受第三方报告"}
+        {
+          "id": 1,
+          "name": "物料清单",
+          "english": "Bill of Material",
+          "required": true
+        },
+        {
+          "id": 2,
+          "name": "工程图纸",
+          "english": "Engineering Drawings",
+          "required": true,
+          "note": "见工程图纸特殊判定规则"
+        },
+        {
+          "id": 3,
+          "name": "样品照片",
+          "english": "Sample Photos",
+          "required": true
+        },
+        {
+          "id": 4,
+          "name": "全尺寸测量报告",
+          "english": "Full Size Measurement Report",
+          "required": true,
+          "note": "必须与图纸尺寸对应"
+        },
+        {
+          "id": 5,
+          "name": "Cpk报告",
+          "english": "Cpk Report",
+          "required": true,
+          "note": "CPK必须≥1.33，需与图纸/全尺寸报告对应"
+        },
+        {
+          "id": 6,
+          "name": "产品规格书",
+          "english": "Product Specifications",
+          "required": true,
+          "note": "见产品规格书判定规则"
+        },
+        {
+          "id": 7,
+          "name": "制造流程图",
+          "english": "Process Flow Chart",
+          "required": true
+        },
+        {
+          "id": 8,
+          "name": "包装方式",
+          "english": "Packaging Method",
+          "required": true
+        },
+        {
+          "id": 9,
+          "name": "QC工程图",
+          "english": "QC Flow Chart",
+          "required": true
+        },
+        {
+          "id": 10,
+          "name": "电气性能测试报告",
+          "english": "Electrical Performance Test Report",
+          "required": "conditional",
+          "note": "按0.2节判定是否必填"
+        },
+        {
+          "id": 11,
+          "name": "可靠性测试报告",
+          "english": "Reliability Test Report",
+          "required": true
+        },
+        {
+          "id": 12,
+          "name": "材质证明",
+          "english": "Material Certificate / SGS Report",
+          "required": true
+        },
+        {
+          "id": 13,
+          "name": "RoHS 2.0限用物质成分调查表",
+          "english": "RoHS 2.0 Substance Survey",
+          "required": true,
+          "note": "报告日期需≤1年，红框字段必填"
+        },
+        {
+          "id": 14,
+          "name": "RoHS 2.0测试报告",
+          "english": "RoHS 2.0 Test Report",
+          "required": true,
+          "note": "接受第三方报告"
+        },
+        {
+          "id": 15,
+          "name": "REACH物质成分调查表",
+          "english": "REACH Substance Survey",
+          "required": true
+        },
+        {
+          "id": 16,
+          "name": "REACH测试报告",
+          "english": "REACH Test Report",
+          "required": true,
+          "note": "接受第三方报告"
+        }
       ]
     },
     "structural": {
       "total_items": 15,
       "items": [
-        {"id": 1, "name": "物料清单", "english": "Bill of Material", "required": true},
-        {"id": 2, "name": "工程图纸", "english": "Engineering Drawings", "required": true},
-        {"id": 3, "name": "样品照片", "english": "Sample Photos", "required": true},
-        {"id": 4, "name": "全尺寸测量报告", "english": "Full Size Measurement Report", "required": true, "note": "必须与图纸尺寸对应"},
-        {"id": 5, "name": "Cpk报告", "english": "Cpk Report", "required": true, "note": "CPK必须≥1.33，需与图纸/全尺寸报告对应"},
-        {"id": 6, "name": "产品规格书", "english": "Product Specifications", "required": true},
-        {"id": 7, "name": "制造流程图", "english": "Process Flow Chart", "required": true},
-        {"id": 8, "name": "包装方式", "english": "Packaging Method", "required": true},
-        {"id": 9, "name": "QC工程图", "english": "QC Flow Chart", "required": true},
-        {"id": 10, "name": "可靠性测试报告", "english": "Reliability Test Report", "required": true},
-        {"id": 11, "name": "材质证明", "english": "Material Certificate / SGS Report", "required": true},
-        {"id": 12, "name": "RoHS 2.0限用物质成分调查表", "english": "RoHS 2.0 Substance Survey", "required": true, "note": "报告日期需≤1年，红框字段必填"},
-        {"id": 13, "name": "RoHS 2.0测试报告", "english": "RoHS 2.0 Test Report", "required": true, "note": "接受第三方报告"},
-        {"id": 14, "name": "REACH物质成分调查表", "english": "REACH Substance Survey", "required": true},
-        {"id": 15, "name": "REACH测试报告", "english": "REACH Test Report", "required": true, "note": "接受第三方报告"}
+        {
+          "id": 1,
+          "name": "物料清单",
+          "english": "Bill of Material",
+          "required": true
+        },
+        {
+          "id": 2,
+          "name": "工程图纸",
+          "english": "Engineering Drawings",
+          "required": true
+        },
+        {
+          "id": 3,
+          "name": "样品照片",
+          "english": "Sample Photos",
+          "required": true
+        },
+        {
+          "id": 4,
+          "name": "全尺寸测量报告",
+          "english": "Full Size Measurement Report",
+          "required": true,
+          "note": "必须与图纸尺寸对应"
+        },
+        {
+          "id": 5,
+          "name": "Cpk报告",
+          "english": "Cpk Report",
+          "required": true,
+          "note": "CPK必须≥1.33，需与图纸/全尺寸报告对应"
+        },
+        {
+          "id": 6,
+          "name": "产品规格书",
+          "english": "Product Specifications",
+          "required": true
+        },
+        {
+          "id": 7,
+          "name": "制造流程图",
+          "english": "Process Flow Chart",
+          "required": true
+        },
+        {
+          "id": 8,
+          "name": "包装方式",
+          "english": "Packaging Method",
+          "required": true
+        },
+        {
+          "id": 9,
+          "name": "QC工程图",
+          "english": "QC Flow Chart",
+          "required": true
+        },
+        {
+          "id": 10,
+          "name": "可靠性测试报告",
+          "english": "Reliability Test Report",
+          "required": true
+        },
+        {
+          "id": 11,
+          "name": "材质证明",
+          "english": "Material Certificate / SGS Report",
+          "required": true
+        },
+        {
+          "id": 12,
+          "name": "RoHS 2.0限用物质成分调查表",
+          "english": "RoHS 2.0 Substance Survey",
+          "required": true,
+          "note": "报告日期需≤1年，红框字段必填"
+        },
+        {
+          "id": 13,
+          "name": "RoHS 2.0测试报告",
+          "english": "RoHS 2.0 Test Report",
+          "required": true,
+          "note": "接受第三方报告"
+        },
+        {
+          "id": 14,
+          "name": "REACH物质成分调查表",
+          "english": "REACH Substance Survey",
+          "required": true
+        },
+        {
+          "id": 15,
+          "name": "REACH测试报告",
+          "english": "REACH Test Report",
+          "required": true,
+          "note": "接受第三方报告"
+        }
       ]
     }
   },
   "category_2_rohs_compliance": {
     "description": "第二类：RoHS合规性检验",
-    "2.1": {"name": "RoHS 2.0测试报告来源", "standard": "必须包含RoHS 2.0测试报告，接受第三方检测报告（CTI华测、SGS、BV、Intertek、TUV等）"},
-    "2.2": {"name": "RoHS调查表日期有效性", "standard": "报告日期距检验日≤365天", "handler": "过期需重新提供"},
-    "2.3": {"name": "RoHS调查表红框必填字段（6个）", "fields": ["Monomer（单体）", "Supplier（供应商）", "Control method（控制方法）", "Number（编号）", "Effective date of report（出报告日期）", "Remarks（备注）"], "rule": "任何一项为空均视为不合格"},
-    "2.4": {"name": "RoHS测试报告日期有效性", "standard": "报告日期距检验日≤365天"}
+    "2.1": {
+      "name": "RoHS 2.0测试报告来源",
+      "standard": "必须包含RoHS 2.0测试报告，接受第三方检测报告（CTI华测、SGS、BV、Intertek、TUV等）"
+    },
+    "2.2": {
+      "name": "RoHS调查表日期有效性",
+      "standard": "报告日期距检验日≤365天",
+      "handler": "过期需重新提供"
+    },
+    "2.3": {
+      "name": "RoHS调查表红框必填字段（6个）",
+      "fields": [
+        "Monomer（单体）",
+        "Supplier（供应商）",
+        "Control method（控制方法）",
+        "Number（编号）",
+        "Effective date of report（出报告日期）",
+        "Remarks（备注）"
+      ],
+      "rule": "任何一项为空均视为不合格"
+    },
+    "2.4": {
+      "name": "RoHS测试报告日期有效性",
+      "standard": "报告日期距检验日≤365天"
+    }
   },
   "category_3_cpk_compliance": {
     "description": "第三类：CPK合规性检验",
-    "3.1": {"name": "CPK值要求", "standard": "关键尺寸CPK必须≥1.33", "calculation": "CPK = min(CPKu, CPKl)", "handler": "CPK<1.33需改善制程能力"},
-    "3.2": {"name": "CPK报告与图纸/全尺寸报告对应性", "standard": "CPK报告尺寸必须与规格图纸、全尺寸量测报告中的尺寸标称值和公差范围完全一致"}
+    "3.1": {
+      "name": "CPK值要求",
+      "standard": "关键尺寸CPK必须≥1.33",
+      "calculation": "CPK = min(CPKu, CPKl)",
+      "handler": "CPK<1.33需改善制程能力"
+    },
+    "3.2": {
+      "name": "CPK报告与图纸/全尺寸报告对应性",
+      "standard": "CPK报告尺寸必须与规格图纸、全尺寸量测报告中的尺寸标称值和公差范围完全一致"
+    }
   },
   "category_4_dimension_correspondence": {
     "description": "第四类：尺寸公差对应性检验（包含关系）",
     "inclusion_relation": "C ⊆ B ⊆ A（CPK报告 ⊆ 全尺寸量测报告 ⊆ 规格图纸）",
-    "4.1": {"name": "三文件尺寸及公差对应性", "method": "从三份文件分别提取尺寸集合A/B/C，验证C⊆B⊆A"}
+    "4.1": {
+      "name": "三文件尺寸及公差对应性",
+      "method": "从三份文件分别提取尺寸集合A/B/C，验证C⊆B⊆A"
+    }
   },
   "category_5_report_timeliness": {
     "description": "第五类：报告时效性检验",
-    "5.1": {"name": "RoHS报告日期", "standard": "报告日期距检验日≤365天", "handler": "要求重新提供有效报告"},
-    "5.2": {"name": "REACH报告日期", "standard": "报告日期距检验日≤365天", "handler": "要求重新提供有效报告"}
+    "5.1": {
+      "name": "RoHS报告日期",
+      "standard": "报告日期距检验日≤365天",
+      "handler": "要求重新提供有效报告"
+    },
+    "5.2": {
+      "name": "REACH报告日期",
+      "standard": "报告日期距检验日≤365天",
+      "handler": "要求重新提供有效报告"
+    }
   },
   "category_6_conclusion": {
     "description": "第六类：检验结论与处理建议",
