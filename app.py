@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.1 稳定优化版
+封样检验Web应用 - V5.3 综合稳定版
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
 V5.1优化：内存管理（gc.collect）、文本截断、实时状态更新、大文件稳定性提升
+V5.3修复：KeyError崩溃防护、Excel错误汇总sheet、大文件稳定性、文件去重
 """
 
 import streamlit as st
@@ -44,123 +45,154 @@ def analyze_pdf_page_by_page(pdf_path):
     V5.1优化: 限制每页文本存储长度，减少内存占用
     """
     results = []
+    all_text = ""
+    tables = []  # V5.2: 在同一次PDF打开中同时提取表格
     try:
+        # V5.3: pdfplumber内存优化
         with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                page_num = page.page_number
-                text = page.extract_text() or ""
-                text_lower = text.lower()
+            for page_idx, page in enumerate(pdf.pages):
+                try:  # V5.3: 单页解析异常不影响其他页
+                    page_num = page.page_number
+                    text = page.extract_text() or ""
+                    text_lower = text.lower()
+                    all_text += text + "\n"
 
-                # V5.1: 只保留前500字符用于后续匹配，完整文本不存入结果
-                # 完整文本在函数内使用后即释放，不再占用内存
-                text_for_storage = text[:500] if len(text) > 500 else text
-                text_lower_for_storage = text_lower[:500] if len(text_lower) > 500 else text_lower
+                    # V5.1: 只保留前500字符用于后续匹配，完整文本不存入结果
+                    text_for_storage = text[:500] if len(text) > 500 else text
+                    text_lower_for_storage = text_lower[:500] if len(text_lower) > 500 else text_lower
 
-                page_info = {
-                    "page_num": page_num,
-                    "text": text_for_storage,          # 截断存储
-                    "text_lower": text_lower_for_storage,  # 截断存储
-                    "is_cover": False,
-                    "is_engineering_drawing": False,
-                    "is_bom": False,
-                    "is_sample_photo": False,
-                    "is_cpk": False,
-                    "is_rohs_survey": False,
-                    "is_reach_survey": False,
-                    "is_product_spec": False,
-                    "drawing_number": "",
-                    "drawing_version": "",
-                    "dimensions": [],
-                }
+                    page_info = {
+                        "page_num": page_num,
+                        "text": text_for_storage,
+                        "text_lower": text_lower_for_storage,
+                        "is_cover": False,
+                        "is_engineering_drawing": False,
+                        "is_bom": False,
+                        "is_sample_photo": False,
+                        "is_cpk": False,
+                        "is_rohs_survey": False,
+                        "is_reach_survey": False,
+                        "is_product_spec": False,
+                        "drawing_number": "",
+                        "drawing_version": "",
+                        "dimensions": [],
+                    }
 
-                # --- 封面页判定 ---
-                if page_num <= 3:
-                    if any(kw in text_lower for kw in ["provisional sample", "临时样品承认书", "sample acknowledgement"]):
-                        page_info["is_cover"] = True
+                    # --- 封面页判定 ---
+                    if page_num <= 3:
+                        if any(kw in text_lower for kw in ["provisional sample", "临时样品承认书", "sample acknowledgement"]):
+                            page_info["is_cover"] = True
 
-                # --- 工程图纸页判定（V4.0 步骤3规则）---
-                drawing_score = 0
-                # 规则1：含图号（如 NC-XC260522-007）
-                drawing_match = re.search(r'[A-Za-z]{2,}-[A-Za-z0-9\-]{3,}', text)
-                if drawing_match:
-                    page_info["drawing_number"] = drawing_match.group(0)
-                    drawing_score += 3
-                # 规则2：含版本号
-                version_match = re.search(r'(版本|rev)\s*[：:]?\s*[A-Za-z0-9]', text_lower)
-                if version_match:
-                    page_info["drawing_version"] = version_match.group(0)
-                    drawing_score += 2
-                # 规则3：含尺寸标注（如 2000±50、5.4±0.2、OD、ID）
-                dim_pattern = r'\d{2,}\s*[±±]\s*\d+|\b(od|id|thk|len)\s*[:：]?\s*\d'
-                if re.search(dim_pattern, text_lower):
-                    dims = re.findall(r'\d+\.?\d*\s*[±±]\s*\d+', text)
-                    page_info["dimensions"] = dims[:10]
-                    drawing_score += 3
-                # 规则4：含标题栏（含 批准/审核/制定）
-                if any(kw in text for kw in ["批准", "审核", "制定", "设计", "approve", "check"]):
-                    drawing_score += 1
-                # 规则5：含比例、视角
-                if any(kw in text_lower for kw in ["比例", "scale", "视角", "view", "top view", "side view"]):
-                    drawing_score += 1
+                    # --- 工程图纸页判定（V4.0 步骤3规则）---
+                    drawing_score = 0
+                    # 规则1：含图号（如 NC-XC260522-007）
+                    drawing_match = re.search(r'[A-Za-z]{2,}-[A-Za-z0-9\-]{3,}', text)
+                    if drawing_match:
+                        page_info["drawing_number"] = drawing_match.group(0)
+                        drawing_score += 3
+                    # 规则2：含版本号
+                    version_match = re.search(r'(版本|rev)\s*[：:]?\s*[A-Za-z0-9]', text_lower)
+                    if version_match:
+                        page_info["drawing_version"] = version_match.group(0)
+                        drawing_score += 2
+                    # 规则3：含尺寸标注（如 2000±50、5.4±0.2、OD、ID）
+                    dim_pattern = r'\d{2,}\s*[±±]\s*\d+|\b(od|id|thk|len)\s*[:：]?\s*\d'
+                    if re.search(dim_pattern, text_lower):
+                        dims = re.findall(r'\d+\.?\d*\s*[±±]\s*\d+', text)
+                        page_info["dimensions"] = dims[:10]
+                        drawing_score += 3
+                    # 规则4：含标题栏（含 批准/审核/制定）
+                    if any(kw in text for kw in ["批准", "审核", "制定", "设计", "approve", "check"]):
+                        drawing_score += 1
+                    # 规则5：含比例、视角
+                    if any(kw in text_lower for kw in ["比例", "scale", "视角", "view", "top view", "side view"]):
+                        drawing_score += 1
 
-                if drawing_score >= 4:
-                    page_info["is_engineering_drawing"] = True
+                    if drawing_score >= 4:
+                        page_info["is_engineering_drawing"] = True
 
-                # --- BOM表页判定 ---
-                if "bom" in text_lower or "物料清单" in text or "bill of material" in text_lower:
-                    page_info["is_bom"] = True
+                    # --- BOM表页判定 ---
+                    if "bom" in text_lower or "物料清单" in text or "bill of material" in text_lower:
+                        page_info["is_bom"] = True
 
-                # --- 样品照片页判定 ---
-                if "附上样品实物" in text or "sample photo" in text_lower or "样品照片" in text:
-                    page_info["is_sample_photo"] = True
+                    # --- 样品照片页判定 ---
+                    if "附上样品实物" in text or "sample photo" in text_lower or "样品照片" in text:
+                        page_info["is_sample_photo"] = True
 
-                # --- CPK报告页判定（V6.1 增强：支持表格形式/繁体中文/多种格式）---
-                cpk_indicators = [
-                    r'cp[kK]\s*[:：=]',                    # cpk: / cpk= / cpk：
-                    r'cp[kK]\s*報告',                      # 繁体 CPK報告
-                    r'cp[kK]\s*报告',                      # 简体 CPK报告
-                    r'cp[kK]\s*report',                   # CPK report
-                    r'cp[kK]\s*值',                        # CPK值
-                    r'cp[kK]\s*[\(（].*?[\)）]',          # CPK(xxx)
-                    r'^.*cp[kK].*$',                       # 任意含CPK的行（宽泛匹配）
-                ]
-                # 宽松匹配：页面文本中只要包含 CPK/Cpk 关键词即判定
-                if re.search(r'cp[kK]', text_lower):
-                    # 进一步确认不是偶然出现（至少出现2次或有相关统计关键词）
-                    cpk_count = len(re.findall(r'cp[kK]', text_lower))
-                    has_cpk_context = any(kw in text_lower for kw in [
-                        'usl', 'lsl', 'ppk', 'stddev', 'average', 'range',
-                        '规格上限', '规格下限', '标准差', '平均值', '量測', '测量',
-                        'dimension', 'tolerance', 'nominal', 'specification'
-                    ])
-                    if cpk_count >= 2 or has_cpk_context:
-                        page_info["is_cpk"] = True
+                    # --- CPK报告页判定（V6.1 增强：支持表格形式/繁体中文/多种格式）---
+                    cpk_indicators = [
+                        r'cp[kK]\s*[:：=]',                    # cpk: / cpk= / cpk：
+                        r'cp[kK]\s*報告',                      # 繁体 CPK報告
+                        r'cp[kK]\s*报告',                      # 简体 CPK报告
+                        r'cp[kK]\s*report',                   # CPK report
+                        r'cp[kK]\s*值',                        # CPK值
+                        r'cp[kK]\s*[\(（].*?[\)）]',          # CPK(xxx)
+                        r'^.*cp[kK].*$',                       # 任意含CPK的行（宽泛匹配）
+                    ]
+                    # 宽松匹配：页面文本中只要包含 CPK/Cpk 关键词即判定
+                    if re.search(r'cp[kK]', text_lower):
+                        # 进一步确认不是偶然出现（至少出现2次或有相关统计关键词）
+                        cpk_count = len(re.findall(r'cp[kK]', text_lower))
+                        has_cpk_context = any(kw in text_lower for kw in [
+                            'usl', 'lsl', 'ppk', 'stddev', 'average', 'range',
+                            '规格上限', '规格下限', '标准差', '平均值', '量測', '测量',
+                            'dimension', 'tolerance', 'nominal', 'specification'
+                        ])
+                        if cpk_count >= 2 or has_cpk_context:
+                            page_info["is_cpk"] = True
 
-                # --- RoHS调查表页判定 ---
-                if "rohs" in text_lower and ("调查表" in text or "survey" in text_lower):
-                    page_info["is_rohs_survey"] = True
+                    # --- RoHS调查表页判定 ---
+                    if "rohs" in text_lower and ("调查表" in text or "survey" in text_lower):
+                        page_info["is_rohs_survey"] = True
 
-                # --- REACH调查表页判定 ---
-                if "reach" in text_lower and ("调查表" in text or "survey" in text_lower):
-                    page_info["is_reach_survey"] = True
+                    # --- REACH调查表页判定 ---
+                    if "reach" in text_lower and ("调查表" in text or "survey" in text_lower):
+                        page_info["is_reach_survey"] = True
 
-                # --- 产品规格书/技术规范判定（V4.0 步骤4规则）---
-                spec_score = 0
-                if any(kw in text for kw in ["绝缘电阻", "insulation resistance", "Ω"]):
-                    spec_score += 2
-                if any(kw in text for kw in ["PVC", "材质", "material spec", "执行标准", "standard"]):
-                    spec_score += 1
-                if any(kw in text_lower for kw in ["100%电气测试", "electrical test", "eia/tia"]):
-                    spec_score += 2
-                if spec_score >= 2:
-                    page_info["is_product_spec"] = True
+                    # --- 产品规格书/技术规范判定（V4.0 步骤4规则）---
+                    spec_score = 0
+                    if any(kw in text for kw in ["绝缘电阻", "insulation resistance", "Ω"]):
+                        spec_score += 2
+                    if any(kw in text for kw in ["PVC", "材质", "material spec", "执行标准", "standard"]):
+                        spec_score += 1
+                    if any(kw in text_lower for kw in ["100%电气测试", "electrical test", "eia/tia"]):
+                        spec_score += 2
+                    if spec_score >= 2:
+                        page_info["is_product_spec"] = True
 
-                results.append(page_info)
+                    # V5.2: 同时提取表格，避免后续重新打开PDF
+                    try:
+                        pt = page.extract_tables()
+                        if pt:
+                            for t in pt:
+                                tables.append({"page": page.page_number, "table": t})
+                    except Exception:
+                        pass
+
+                    results.append(page_info)
+                except Exception as page_err:
+                    # V5.3: 单页解析失败记录错误但继续处理其他页面
+                    results.append({
+                        "page_num": page_idx + 1 if 'page_idx' in dir() else 0,
+                        "text": f"[第{page_idx+1}页解析失败: {str(page_err)[:100]}]",
+                        "text_lower": "",
+                        "is_cover": False, "is_engineering_drawing": False,
+                        "is_bom": False, "is_sample_photo": False,
+                        "is_cpk": False, "is_rohs_survey": False,
+                        "is_reach_survey": False, "is_product_spec": False,
+                        "drawing_number": "", "drawing_version": "",
+                        "dimensions": [],
+                    })
+                    continue
 
     except Exception as e:
-        results.append({"error": str(e)})
+        results.append({"error": str(e), "all_text": all_text, "tables": tables})
 
-    return results
+    # V5.2: 截断过长的全文文本，避免内存爆炸
+    if len(all_text) > 50000:
+        all_text = all_text[:50000] + "\n[... 文本过长，已截断 ...]"
+
+    return results, all_text, tables  # V5.2: 同时返回预提取的表格
 
 
 def check_file_type(pdf_path, pdf_text):
@@ -291,12 +323,13 @@ def extract_dates_from_text(text):
     return dates
 
 
-def extract_cpk_values(text, pdf_path=None):
+def extract_cpk_values(text, tables=None):
     """
     V6.1 增强：从文本和表格中提取CPK值
+    V5.2 优化：接受预提取的 tables，避免重复打开PDF
     支持多种格式：
     1. 文本键值对：cpk: 1.33 / cpk=1.33
-    2. 表格形式：CPK列头 + 数值行（pdfplumber extract_tables）
+    2. 表格形式：CPK列头 + 数值行（使用预提取的tables）
     3. 统计行格式：... | CPK | 0.67 | 3.84 | ...
     4. 宽松相邻匹配：CPK/Cpk 紧邻数字
     """
@@ -329,79 +362,61 @@ def extract_cpk_values(text, pdf_path=None):
             except ValueError:
                 continue
 
-    # ===== 方法2：从PDF表格中提取CPK值（V6.1 核心新增）=====
-    if pdf_path:
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
-                    tables = page.extract_tables()
-                    if not tables:
+    # ===== 方法2：从预提取的表格中提取CPK值（V5.2 优化）=====
+    if tables:
+        for t_dict in tables:
+            table = t_dict["table"]  # pdfplumber extract_tables() 返回的一个表格
+            if not table or len(table) < 2:
+                continue
+            # 寻找包含 CPK 的表头行
+            for row_idx, row in enumerate(table):
+                if row is None:
+                    continue
+                row_strs = [str(c).strip() if c else "" for c in row]
+                row_text_lower = " ".join(row_strs).lower()
+                if re.search(r'cp[kK]', row_text_lower):
+                    cpk_col_indices = []
+                    for col_idx, cell in enumerate(row_strs):
+                        if re.search(r'cp[kK]', cell.lower()):
+                            cpk_col_indices.append(col_idx)
+                    if cpk_col_indices:
+                        for data_row_idx in range(row_idx + 1, min(row_idx + 11, len(table))):
+                            data_row = table[data_row_idx]
+                            if data_row is None:
+                                continue
+                            for col_idx in cpk_col_indices:
+                                cell_val = data_row[col_idx] if col_idx < len(data_row) else None
+                                if cell_val is not None:
+                                    val_str = str(cell_val).strip()
+                                    num_match = re.match(r'^(\d+\.?\d*)$', val_str)
+                                    if num_match:
+                                        try:
+                                            add_val(float(num_match.group(1)))
+                                        except ValueError:
+                                            pass
+                                    elif re.search(r'\d+\.\d{1,2}', val_str):
+                                        nums = re.findall(r'\d+\.\d{1,2}', val_str)
+                                        for n in nums:
+                                            try:
+                                                add_val(float(n))
+                                            except ValueError:
+                                                pass
+                        break
+
+            # 额外：扫描整个表格中的CPK数值模式
+            for row in table:
+                if row is None:
+                    continue
+                for cell in row:
+                    if cell is None:
                         continue
-                    for table in tables:
-                        if not table or len(table) < 2:
-                            continue
-                        # 寻找包含 CPK 的表头行
-                        for row_idx, row in enumerate(table):
-                            if row is None:
-                                continue
-                            # 将row中所有单元格转为字符串
-                            row_strs = [str(c).strip() if c else "" for c in row]
-                            row_text_lower = " ".join(row_strs).lower()
-
-                            # 检查此行是否含CPK相关表头
-                            if re.search(r'cp[kK]', row_text_lower):
-                                # 找到CPK列的索引
-                                cpk_col_indices = []
-                                for col_idx, cell in enumerate(row_strs):
-                                    if re.search(r'cp[kK]', cell.lower()):
-                                        cpk_col_indices.append(col_idx)
-
-                                # 如果找到了CPK列，从后续数据行中取值
-                                if cpk_col_indices:
-                                    # 查看后续数据行（最多往后查10行）
-                                    for data_row_idx in range(row_idx + 1, min(row_idx + 11, len(table))):
-                                        data_row = table[data_row_idx]
-                                        if data_row is None:
-                                            continue
-                                        for col_idx in cpk_col_indices:
-                                            cell_val = data_row[col_idx] if col_idx < len(data_row) else None
-                                            if cell_val is not None:
-                                                val_str = str(cell_val).strip()
-                                                # 提取数字
-                                                num_match = re.match(r'^(\d+\.?\d*)$', val_str)
-                                                if num_match:
-                                                    try:
-                                                        add_val(float(num_match.group(1)))
-                                                    except ValueError:
-                                                        pass
-                                                # 也尝试更宽松的提取
-                                                elif re.search(r'\d+\.\d{1,2}', val_str):
-                                                    nums = re.findall(r'\d+\.\d{1,2}', val_str)
-                                                    for n in nums:
-                                                        try:
-                                                            add_val(float(n))
-                                                        except ValueError:
-                                                            pass
-                                    break  # 只处理第一个含CPK的表头行
-
-                        # 额外：扫描整个表格中的CPK数值模式
-                        # 有些PDF的表格结构不规则，直接搜索所有单元格
-                        for row in table:
-                            if row is None:
-                                continue
-                            for cell in row:
-                                if cell is None:
-                                    continue
-                                cell_str = str(cell).strip()
-                                # 匹配如 "CPK=0.67" 或 "Cpk: 3.84" 格式的单元格
-                                m = re.search(r'cp[kK]\s*[:：=]?\s*(\d+\.?\d*)', cell_str, re.IGNORECASE)
-                                if m:
-                                    try:
-                                        add_val(float(m.group(1)))
-                                    except ValueError:
-                                        pass
-        except Exception:
-            pass  # 表格提取失败时静默跳过，不影响主流程
+                    cell_str = str(cell).strip()
+                    m = re.search(r'cp[kK]\s*[:：=]?\s*(\d+\.?\d*)', cell_str, re.IGNORECASE)
+                    if m:
+                        try:
+                            add_val(float(m.group(1)))
+                        except ValueError:
+                            pass
 
     # ===== 方法3：多行统计摘要匹配 =====
     # 匹配类似 "CPK  0.67  3.84  4.00" 这种同行多值格式
@@ -647,10 +662,11 @@ def inspect_rohs_compliance(page_analysis, standards, check_date):
     return results
 
 
-def inspect_cpk_compliance(page_analysis, standards, pdf_text, pdf_path=None):
+def inspect_cpk_compliance(page_analysis, standards, pdf_text, tables=None):
     """
     第三类：CPK合规性检验（2子项）
     V6.1: 支持从PDF表格中提取CPK值
+    V5.2: 接受预提取的表格，避免重复打开PDF
     """
     results = {
         "sub_items": {},
@@ -661,8 +677,8 @@ def inspect_cpk_compliance(page_analysis, standards, pdf_text, pdf_path=None):
 
     all_text = " ".join(p.get("text", "") for p in page_analysis)
 
-    # 3.1 提取CPK值（V6.1: 传入pdf_path以支持表格解析）
-    cpk_values = extract_cpk_values(all_text, pdf_path=pdf_path)
+    # 3.1 提取CPK值（V6.1: 传入tables以避免重复打开PDF）
+    cpk_values = extract_cpk_values(all_text, tables=tables)
     results["cpk_values"] = cpk_values
 
     if cpk_values:
@@ -1337,9 +1353,8 @@ def run_full_inspection(file_path, file_name, standards):
     check_date = datetime.now()
     version = standards.get("version", "未知")
 
-    # 提取PDF并逐页分析（V4.0 核心）
-    page_analysis = analyze_pdf_page_by_page(file_path)
-    all_text = extract_all_text(file_path)
+    # 提取PDF并逐页分析（V4.0 核心）—— V5.2 优化：一次打开完成所有解析
+    page_analysis, all_text, tables = analyze_pdf_page_by_page(file_path)
 
     # 第零步：物料类型判定
     mat_type, mat_type_cn, mat_kw, needs_elec = determine_material_type(file_name, standards)
@@ -1350,7 +1365,7 @@ def run_full_inspection(file_path, file_name, standards):
     # 第二步~第五步：各类检验（基于逐页分析结果）
     completeness = inspect_file_completeness_v4(page_analysis, mat_type, standards)
     rohs = inspect_rohs_compliance(page_analysis, standards, check_date)
-    cpk = inspect_cpk_compliance(page_analysis, standards, all_text, pdf_path=file_path)
+    cpk = inspect_cpk_compliance(page_analysis, standards, all_text, tables=tables)
     dimension = inspect_dimension_correspondence(page_analysis, standards)
     validity = inspect_report_validity(page_analysis, standards, check_date)
 
@@ -1552,13 +1567,25 @@ with col2:
     if run_btn:
         all_paths = []
         if uploaded_files:
+            seen_names = set()  # V5.3: 去重用
             for uf in uploaded_files:
+                fname = uf.name
+                # V5.3: 按文件名去重（同名文件只保留最后一个）
+                if fname in seen_names:
+                    st.warning(f"⚠️ 跳过重复文件: {fname}")
+                    continue
+                seen_names.add(fname)
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
                 tmp.write(uf.getvalue())
-                all_paths.append((tmp.name, uf.name))
+                all_paths.append((tmp.name, fname))
         if 'folder_files' in st.session_state:
+            seen_folder = set()  # V5.3: 文件夹扫描也去重
             for fp in st.session_state['folder_files']:
-                all_paths.append((fp, os.path.basename(fp)))
+                bname = os.path.basename(fp)
+                if bname in seen_folder:
+                    continue
+                seen_folder.add(bname)
+                all_paths.append((fp, bname))
 
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
@@ -1587,13 +1614,36 @@ with col2:
                                     sub.pop('items', None)  # 释放详细项目列表
 
                 except Exception as e:
+                    import traceback
                     error_msg = str(e)
                     st.error(f"❌ 审核文件 {fname} 时出错: {error_msg}")
+                    # V5.3: 补全_detail所有字段，避免后续展示时KeyError
                     detail_results.append({
                         "文件名": fname,
-                        "总体结论": f"❌ 审核异常: {error_msg[:50]}",
+                        "总体结论": f"❌ 审核异常: {error_msg[:80]}",
                         "问题数量": 1,
-                        "_detail": {"final": {"verdict": f"❌ 异常", "suggestion": f"审核出错: {e}"}},
+                        "_detail": {
+                            "final": {
+                                "verdict": f"❌ 异常",
+                                "suggestion": f"审核出错({type(e).__name__}): {str(e)[:200]}",
+                                "issue_count": 1,
+                                "error_traceback": traceback.format_exc()[-500:]
+                            },
+                            # V5.3: 补全所有可能被展示访问的键
+                            "mat_type": "unknown",
+                            "mat_type_cn": "未知(异常)",
+                            "needs_elec": False,
+                            "file_type": "unknown",
+                            "file_type_note": "⏱ 异常中断",
+                            "page_analysis": [],
+                            "completeness": {"items": [], "status": "⏱ 异常", "pass_count": 0, "fail_count": 0},
+                            "rohs": {"sub_items": {}, "overall_status": "⏱ 异常", "issues": []},
+                            "cpk": {"sub_items": {}, "overall_status": "⏱ 异常", "issues": [], "cpk_values": []},
+                            "dimension": {"sub_items": {}, "overall_status": "⏱ 异常", "issues": []},
+                            "validity": {"sub_items": {}, "overall_status": "⏱ 异常", "issues": []},
+                            "catalog_check": None,
+                            "part_consistency": None,
+                        },
                         **{k: "⏱ 异常" for k in [
                             "文件类型","物料类型","需要电气性能测试",
                             "文件完整性","RoHS合规性","CPK合规性",
@@ -1661,38 +1711,63 @@ with col2:
 
                     # 文件完整性详情
                     st.subheader("1️⃣ 文件完整性检验")
-                    comp_df = pd.DataFrame(d["completeness"]["items"])
-                    st.dataframe(comp_df, hide_index=True, use_container_width=True)
+                    comp_data = d.get("completeness") or {}
+                    comp_items = comp_data.get("items")
+                    if comp_items:
+                        comp_df = pd.DataFrame(comp_items)
+                        st.dataframe(comp_df, hide_index=True, use_container_width=True)
+                    else:
+                        st.text(f"⏱ 无完整性数据 ({comp_data.get('status', '未知')})")
 
                     # RoHS详情
                     if rohs_check:
                         st.subheader("2️⃣ RoHS合规性检验")
-                        for k, v in d["rohs"]["sub_items"].items():
-                            st.text(f"{k}: {v}")
+                        rohs_sub = (d.get("rohs") or {}).get("sub_items", {})
+                        if rohs_sub:
+                            for k, v in rohs_sub.items():
+                                st.text(f"{k}: {v}")
+                        else:
+                            st.text("⏱ 无RoHS数据")
 
                     # CPK详情
                     if cpk_check:
                         st.subheader("3️⃣ CPK合规性检验")
-                        for k, v in d["cpk"]["sub_items"].items():
-                            st.text(f"{k}: {v}")
-                        if d["cpk"]["cpk_values"]:
-                            st.text(f"检测到的CPK值: {d['cpk']['cpk_values']}")
+                        cpk_data = d.get("cpk") or {}
+                        cpk_sub = cpk_data.get("sub_items", {})
+                        if cpk_sub:
+                            for k, v in cpk_sub.items():
+                                st.text(f"{k}: {v}")
+                        else:
+                            st.text("⏱ 无CPK数据")
+                        cpk_vals = cpk_data.get("cpk_values", [])
+                        if cpk_vals:
+                            st.text(f"检测到的CPK值: {cpk_vals}")
 
                     # 尺寸对应性详情
                     if dim_check:
                         st.subheader("4️⃣ 尺寸公差对应性检验")
-                        for k, v in d["dimension"]["sub_items"].items():
-                            st.text(f"{k}: {v}")
+                        dim_sub = (d.get("dimension") or {}).get("sub_items", {})
+                        if dim_sub:
+                            for k, v in dim_sub.items():
+                                st.text(f"{k}: {v}")
+                        else:
+                            st.text("⏱ 无尺寸数据")
 
                     # 报告时效性详情
                     if validity_check:
                         st.subheader("5️⃣ 报告时效性检验")
-                        for k, v in d["validity"]["sub_items"].items():
-                            st.text(f"{k}: {v}")
+                        val_sub = (d.get("validity") or {}).get("sub_items", {})
+                        if val_sub:
+                            for k, v in val_sub.items():
+                                st.text(f"{k}: {v}")
+                        else:
+                            st.text("⏱ 无时效性数据")
 
                     # V6.2 新增：目录勾选状态
                     if d.get("catalog_check"):
                         cat = d["catalog_check"]
+                        if not isinstance(cat, dict):
+                            continue
                         st.subheader("6️⃣ 目录/Catalog勾选状态（V6.2）")
                         st.markdown(f"**判定结果:** {cat.get('status', 'N/A')}")
                         if cat.get('details'):
@@ -1709,6 +1784,8 @@ with col2:
                     # V6.2 新增：料号&物料名称跨表一致性
                     if d.get("part_consistency"):
                         pc = d["part_consistency"]
+                        if not isinstance(pc, dict):
+                            continue
                         st.subheader("7️⃣ 料号&物料名称跨表一致性（V6.2）")
                         st.markdown(f"**整体判定:** {pc.get('overall_status', 'N/A')}")
                         # 显示封面参考信息
@@ -1738,10 +1815,127 @@ with col2:
             col_dl1, col_dl2 = st.columns(2)
             with col_dl1:
                 excel_buf = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-                df_summary.to_excel(excel_buf.name, index=False, engine="openpyxl")
+                from openpyxl import Workbook
+                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+                from openpyxl.utils.dataframe import dataframe_to_rows
+
+                wb = Workbook()
+                
+                # --- Sheet1: 审核汇总 ---
+                ws_summary = wb.active
+                ws_summary.title = "审核汇总"
+                for r_idx, row in enumerate(dataframe_to_rows(df_summary, index=False, header=True)):
+                    for c_idx, value in enumerate(row):
+                        cell = ws_summary.cell(row=r_idx+1, column=c_idx+1, value=value)
+                        if r_idx == 0:
+                            cell.font = Font(bold=True, color="FFFFFF")
+                            cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                            cell.alignment = Alignment(horizontal="center")
+
+                # --- Sheet2: 错误汇总（V5.3新增）---
+                ws_error = wb.create_sheet("错误汇总")
+                error_rows = []
+                error_header_written = False
+                for res in detail_results:
+                    dd = res.get("_detail", {})
+                    issues_found = []
+                    
+                    # 从各检查项中收集问题
+                    checks = [
+                        ("文件完整性", dd.get("completeness")),
+                        ("RoHS合规", dd.get("rohs")),
+                        ("CPK合规", dd.get("cpk")),
+                        ("尺寸对应性", dd.get("dimension")),
+                        ("报告时效性", dd.get("validity")),
+                        ("目录勾选", dd.get("catalog_check")),
+                        ("料号一致性", dd.get("part_consistency")),
+                    ]
+                    
+                    for check_name, check_data in checks:
+                        if not check_data or not isinstance(check_data, dict):
+                            continue
+                        # 收集issues
+                        for issue in check_data.get("issues", []):
+                            issues_found.append({
+                                "文件名": res.get("文件名", ""),
+                                "检查类别": check_name,
+                                "问题描述": str(issue)[:200],
+                                "严重程度": "❌ 不合格" if "不合格" in str(issue) else "⚠️ 警告",
+                                "建议操作": "请人工核实并补充相应资料或重新提交",
+                            })
+                        # sub_items中的失败项
+                        for sub_k, sub_v in check_data.get("sub_items", {}).items():
+                            if isinstance(sub_v, str) and ("❌" in sub_v or "不合格" in sub_v or "缺失" in sub_v):
+                                issues_found.append({
+                                    "文件名": res.get("文件名", ""),
+                                    "检查类别": check_name,
+                                    "问题描述": f"{sub_k}: {sub_v}"[:200],
+                                    "严重程度": "❌ 不合格" if "❌" in sub_v else "⚠️ 警告",
+                                    "建议操作": "请人工核实并补充相应资料或重新提交",
+                                })
+                        
+                    # 最终判定中的问题
+                    final = dd.get("final", {})
+                    if "不合格" in final.get("verdict", "") or "异常" in final.get("verdict", ""):
+                        issues_found.append({
+                            "文件名": res.get("文件名", ""),
+                            "检查类别": "最终结论",
+                            "问题描述": final.get("verdict", "") + " | " + final.get("suggestion", "")[:150],
+                            "严重程度": "❌ 关键问题" if "不合格" in final.get("verdict", "") else "⚠️ 异常",
+                            "建议操作": final.get("suggestion", "请人工复核")[:200],
+                        })
+                    
+                    error_rows.extend(issues_found)
+                
+                if error_rows:
+                    # 写表头
+                    err_headers = ["序号", "文件名", "检查类别", "问题描述", "严重程度", "建议操作"]
+                    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                    yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+                    red_font = Font(color="9C0006")
+                    bold_font = Font(bold=True)
+                    thin_border = Border(
+                        left=Side(style='thin'), right=Side(style='thin'),
+                        top=Side(style='thin'), bottom=Side(style='thin')
+                    )
+                    
+                    for c_idx, h in enumerate(err_headers):
+                        cell = ws_error.cell(row=1, column=c_idx+1, value=h)
+                        cell.font = Font(bold=True, color="FFFFFF")
+                        cell.fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
+                        cell.alignment = Alignment(horizontal="center")
+                    
+                    for r_idx, erow in enumerate(error_rows):
+                        for c_idx, key in enumerate(err_headers):
+                            val = erow.get(key, "")
+                            if c_idx == 0:
+                                val = r_idx + 1
+                            cell = ws_error.cell(row=r_idx+2, column=c_idx+1, value=val)
+                            cell.border = thin_border
+                            cell.alignment = Alignment(wrap_text=True, vertical="top")
+                            # 根据严重程度着色
+                            sev = str(erow.get("严重程度", ""))
+                            if "关键" in sev or "不合格" in sev:
+                                cell.fill = red_fill
+                                cell.font = red_font
+                            elif "警告" in sev or "⚠️" in sev:
+                                cell.fill = yellow_fill
+                    
+                    # 设置列宽
+                    ws_error.column_dimensions['A'].width = 6
+                    ws_error.column_dimensions['B'].width = 30
+                    ws_error.column_dimensions['C'].width = 14
+                    ws_error.column_dimensions['D'].width = 50
+                    ws_error.column_dimensions['E'].width = 12
+                    ws_error.column_dimensions['F'].width = 35
+                else:
+                    ws_error.cell(row=1, column=1, value="✅ 所有文件均通过审核，无错误项！")
+                    ws_error.cell(row=1, column=1).font = Font(bold=True, size=14, color="006400")
+                
+                wb.save(excel_buf.name)
                 with open(excel_buf.name, "rb") as ef:
                     st.download_button(
-                        label="📥 下载审核汇总 Excel",
+                        label="📥 下载审核汇总 Excel（含错误汇总Sheet）",
                         data=ef,
                         file_name=f"封样审核汇总_V{version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1782,7 +1976,7 @@ st.markdown("""
 3. **开始审核** — 点击按钮，等待审核完成
 4. **查看结果** — 展开每个文件的详细信息，下载Excel/Markdown报告
 
-### ⚙️ V5.1 版本说明（与SKILL.md同步）
+### ⚙️ V5.3 版本说明（与SKILL.md同步）
 | 功能 | 状态 |
 |------|--------|
 | 文件类型检查（DQM-001 vs DQM-002） | ✅ |
@@ -1798,6 +1992,11 @@ st.markdown("""
 | **料号&物料名称跨表一致性检查** | ✅ **V6.2新增** |
 | **内存优化（gc.collect + 文本截断）** | ✅ **V5.1新增** |
 | **大文件稳定性提升（实时状态+错误恢复）** | ✅ **V5.1新增** |
+| **速度优化（PDF只打开一次，避免重复解析）** | ✅ **V5.2新增** |
+| **KeyError崩溃防护（安全访问所有_detail字段）** | ✅ **V5.3新增** |
+| **Excel错误汇总sheet（红/黄标识+建议操作）** | ✅ **V5.3新增** |
+| **单页解析异常隔离（一页失败不影响其他页）** | ✅ **V5.3新增** |
+| **文件上传去重（同名文件自动跳过）** | ✅ **V5.3新增** |
 
 > 💡 **注意：** 本工具使用PDF文本解析技术进行自动化审核，部分内容（如图片中的尺寸标注、手写签名等）可能需要人工辅助确认。
 """)
