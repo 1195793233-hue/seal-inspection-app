@@ -1775,7 +1775,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.1: 优化内存管理)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.6: 检测精度增强)")
 
             progress = st.progress(0)
             detail_results = []
