@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.8 出错复位版
+封样检验Web应用 - V5.8.1 修复版
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -1698,7 +1698,7 @@ def run_full_inspection(file_path, file_name, standards):
         _pn = part_consistency.get("cover_info", {}).get("part_number", "")
         if not _pn:
             # 如果封面没提取到，尝试从文件名提取
-            _pn_match = re.search(r"[A-Za-z]\d{4}\d+[A-Za-z]*", file_name)
+            _pn_match = re.search(r"([A-Za-z]\d{4}\d+[A-Za-z]*)", file_name)
             if _pn_match:
                 _pn = _pn_match.group(1)
         if _pn:
@@ -1974,7 +1974,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8: 增加出错复位机制)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.1: 修复正则group错误)")
 
             progress = st.progress(0)
             detail_results = []
