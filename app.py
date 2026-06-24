@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.4 大文件稳定版
+封样检验Web应用 - V5.6 检测精度增强版
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -61,9 +61,13 @@ def analyze_pdf_page_by_page(pdf_path):
                     text_lower = text.lower()
                     all_text += text + "\n"
 
-                    # V5.1: 只保留前500字符用于后续匹配，完整文本不存入结果
-                    text_for_storage = text[:500] if len(text) > 500 else text
-                    text_lower_for_storage = text_lower[:500] if len(text_lower) > 500 else text_lower
+                    # V5.6: 前3页保留完整文本（封面/目录/物料信息），其他页截断至1500字符
+                    if page_num <= 3:
+                        text_for_storage = text
+                        text_lower_for_storage = text_lower
+                    else:
+                        text_for_storage = text[:1500] if len(text) > 1500 else text
+                        text_lower_for_storage = text_lower[:1500] if len(text_lower) > 1500 else text_lower
 
                     page_info = {
                         "page_num": page_num,
@@ -323,8 +327,10 @@ def extract_pdf_tables(pdf_path):
 
 
 def extract_dates_from_text(text):
-    """从文本中提取所有日期"""
+    """从文本中提取所有日期（V5.6增强：支持更多日期格式）"""
     dates = []
+    
+    # 格式1: YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD
     patterns = [
         r'(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})',
     ]
@@ -336,6 +342,43 @@ def extract_dates_from_text(text):
                 dates.append(datetime.strptime(date_str, "%Y-%m-%d").date())
             except ValueError:
                 continue
+    
+    # 格式2（V5.6新增）：英文月份格式 "Feb 28, 2026" / "February 28, 2026" / "28-Feb-2026"
+    month_names = {
+        'jan': 1, 'january': 1, 'feb': 2, 'february': 2,
+        'mar': 3, 'march': 3, 'apr': 4, 'april': 4,
+        'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
+        'aug': 8, 'august': 8, 'sep': 9, 'september': 9,
+        'oct': 10, 'october': 10, 'nov': 11, 'november': 11,
+        'dec': 12, 'december': 12,
+    }
+    # "Month DD, YYYY" 或 "Month DD YYYY"
+    eng_date_pattern = r'([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})'
+    for m in re.findall(eng_date_pattern, text, re.IGNORECASE):
+        month_str, day, year = m[0].lower(), int(m[1]), int(m[2])
+        if month_str in month_names:
+            try:
+                dates.append(datetime(year, month_names[month_str], day).date())
+            except ValueError:
+                continue
+    # "DD-Mon-YYYY" 或 "DD/Mon/YYYY"
+    short_eng_pattern = r'(\d{1,2})[-/]([A-Za-z]{3})[-/](\d{4})'
+    for m in re.findall(short_eng_pattern, text):
+        day, month_str, year = int(m[0]), m[1].lower(), int(m[2])
+        if month_str in month_names:
+            try:
+                dates.append(datetime(year, month_names[month_str], day).date())
+            except ValueError:
+                continue
+
+    # 格式3（V5.6新增）：中文日期 "2026年11月1日" / "2026年06月01日"
+    cn_date_pattern = r'(\d{4})年(\d{1,2})月(\d{1,2})日'
+    for m in re.findall(cn_date_pattern, text):
+        try:
+            dates.append(datetime(int(m[0]), int(m[1]), int(m[2])).date())
+        except ValueError:
+            continue
+
     return dates
 
 
@@ -434,6 +477,44 @@ def extract_cpk_values(text, tables=None):
                         except ValueError:
                             pass
 
+            # ===== 方法2b（V5.6新增）：Cpk作为行标签，数值在其右侧单元格 =====
+            # 格式示例：| Dim | 1 | 2 | 3 | 4 | 5 |
+            #           | ... | ... | ... | ... | ... | ... |
+            #           | Cpk | 1.66 | 1.56 | 1.69 | 1.73 | 1.56 |
+            for row_idx, row in enumerate(table):
+                if row is None:
+                    continue
+                row_strs = [str(c).strip() if c else "" for c in row]
+                # 寻找Cpk所在的单元格位置
+                cpk_cell_idx = None
+                for col_idx, cell in enumerate(row_strs):
+                    if re.match(r'^[Cc]p[kK]$', cell.strip()):
+                        cpk_cell_idx = col_idx
+                        break
+                if cpk_cell_idx is not None:
+                    # 读取该行中Cpk右侧所有单元格的数值
+                    for col_idx in range(cpk_cell_idx + 1, len(row_strs)):
+                        val = row_strs[col_idx].strip()
+                        if not val:
+                            continue
+                        # 纯数字
+                        num_match = re.match(r'^(\d+\.?\d*)$', val)
+                        if num_match:
+                            try:
+                                v = float(num_match.group(1))
+                                if 0 <= v <= 100:
+                                    add_val(v)
+                            except ValueError:
+                                pass
+                        # 嵌入数字
+                        elif re.search(r'\d+\.\d{1,2}', val):
+                            nums = re.findall(r'\d+\.\d{1,2}', val)
+                            for n in nums:
+                                try:
+                                    add_val(float(n))
+                                except ValueError:
+                                    pass
+
     # ===== 方法3：多行统计摘要匹配 =====
     # 匹配类似 "CPK  0.67  3.84  4.00" 这种同行多值格式
     multi_cpk_pattern = r'cp[kK][\s\:：]*([0-9.]+(?:\s+[0-9.]+)*)'
@@ -464,28 +545,34 @@ def check_keyword_in_text(text, keywords):
 # 审核核心逻辑
 # ============================================================
 
-def determine_material_type(file_name, standards):
+def determine_material_type(file_name, standards, pdf_content_hint=None):
     """
     第零步：判定物料类型（电子料 vs 结构件）
+    V5.5增强: 支持基于文件名和PDF内容双重判定
     返回: (type_str, type_cn, matched_keyword, needs_electrical_test)
     """
     file_lower = file_name.lower()
+    # V5.5: 合并文件名和PDF内容用于关键词匹配
+    search_text = file_lower
+    if pdf_content_hint:
+        search_text = file_lower + " " + pdf_content_hint.lower()
 
     electronic_kw = standards.get("material_types", {}).get("electronic", {}).get("keywords", [])
     structural_kw = standards.get("material_types", {}).get("structural", {}).get("keywords", [])
 
-    # 先检查电子料关键词
+    # 先检查电子料关键词（优先在合并文本中搜索）
     for kw in electronic_kw:
-        if kw.lower() in file_lower:
+        if kw.lower() in search_text:
             required_electrical = standards.get("material_types", {}).get(
                 "electronic", {}
             ).get("required_electrical_test", [])
-            needs_elec = any(e_kw.lower() in file_lower for e_kw in required_electrical)
+            needs_elec = any(e_kw.lower() in search_text for e_kw in required_electrical)
+            source = "(PDF内容)" if pdf_content_hint and kw.lower() not in file_lower and kw.lower() in pdf_content_hint.lower() else "(文件名)"
             return "electronic", "电子料", kw, needs_elec
 
     # 再检查结构件关键词
     for kw in structural_kw:
-        if kw.lower() in file_lower:
+        if kw.lower() in search_text:
             return "structural", "结构件", kw, False
 
     return "unknown", "未知类型", None, False
@@ -608,12 +695,19 @@ def inspect_rohs_compliance(page_analysis, standards, check_date):
     all_text = " ".join(p.get("text", "") for p in page_analysis)
     all_text_lower = all_text.lower()
 
-    # 2.1 RoHS 2.0测试报告是否存在
-    rohs_report_found = (
-        "rohs 2.0 test report" in all_text_lower or
-        "rohs测试报告" in all_text_lower or
-        "rohs 2.0 report" in all_text_lower
-    )
+    # 2.1 RoHS 2.0测试报告是否存在（V5.6增强：扩展关键词+表格检测）
+    rohs_keywords = [
+        "rohs 2.0 test report", "rohs测试报告", "rohs 2.0 report",
+        "rohs 2.0 restricted substances", "rohs 2.0限制物质",
+        "rohs 2.0 test report",  # 大小写变体
+        "restricted substances composition",  # 英文调查表标题
+        "sgs", "test report",  # SGS测试报告标识
+    ]
+    rohs_report_found = any(kw in all_text_lower for kw in rohs_keywords)
+
+    # V5.6额外检查：是否有页面被标记为RoHS页
+    if not rohs_report_found:
+        rohs_report_found = any(p.get("is_rohs_survey") for p in page_analysis)
     results["sub_items"]["2.1_RoHS测试报告"] = (
         "✅ 已提供" if rohs_report_found else "❌ 未提供"
     )
@@ -850,17 +944,20 @@ def extract_cover_info(page_analysis, pdf_path):
         for i, line in enumerate(lines):
             line_stripped = line.strip()
 
-            # 提取料号（多种格式）
-            pn_patterns = [
-                r'(?:Material\s*(?:number|编号)|物料编号|Part\s*Number|料号|零件号)[\s:：]*([A-Za-z0-9_\-]+)',
-                r'(?:Product\s*name|产品名称)[\s:：]*(.+)',
-            ]
+            # 提取料号（多种格式，V5.6增强）
+            # 注意：patterns仅用于文档说明，实际匹配在下面单独进行
 
-            # 料号匹配
+            # 料号匹配（V5.6增强：支持冒号/等号/括号等多种分隔符）
             pn_match = re.search(
-                r'(?:Material\s*(?:number|编号)|物料编号|Part\s*Number[（(]?料号[）)]?|料号|零件号)[\s:：\s]*([A-Za-z0-9_\-]+)',
+                r'(?:Material\s*(?:number|No\.?|编号)?|物料编号|Part\s*Number[\(（]?料号[\)）]?|料号[\/\s]*:?|零件号)[\s:：()（）\-*]*([A-Za-z0-9][A-Za-z0-9_\-]*)',
                 line, re.IGNORECASE
             )
+            # V5.6额外尝试：直接匹配 K+数字 字母混合格式（常见料号格式）
+            if not pn_match:
+                pn_match = re.search(
+                    r'\b(K\d+[A-Za-z]*)\b',  # 如 K6970000223LA
+                    line
+                )
             if pn_match and not result["part_number"]:
                 result["part_number"] = pn_match.group(1).strip()
                 result["page_num"] = p["page_num"]
@@ -1018,9 +1115,10 @@ def extract_table_headers_part_info(page_analysis, tables=None):
     return table_infos
 
 
-def check_catalog_checkboxes(pdf_path, page_analysis):
+def check_catalog_checkboxes(pdf_path, page_analysis, tables=None):  # V5.5: 接受预提取表格
     """
     V6.2 功能1：目录/Catalog勾选状态检测
+    V5.5优化: 支持从预提取的表格数据中检测勾选状态（解决表格形式目录页检测失效问题）
     判定目录中的16项是否全部已勾选
     返回: dict with checklist status
     """
@@ -1067,6 +1165,65 @@ def check_catalog_checkboxes(pdf_path, page_analysis):
     result["has_catalog_page"] = True
     result["catalog_page_num"] = catalog_page["page_num"]
     text = catalog_page["text"]
+
+    # ===== V5.5 新增：方法0 - 从预提取表格中检测目录勾选 =====
+    _catalog_from_table = False
+    if tables:
+        for t_dict in tables:
+            tbl = t_dict.get("table", [])
+            tbl_page = t_dict.get("page", 0)
+            if tbl_page != catalog_page["page_num"]:
+                continue
+            if not tbl or len(tbl) < 2:
+                continue
+            # 检查此表格是否为目录表格（含Catalog/目录标题）
+            _tbl_header_text = ""
+            for row in tbl[:2]:
+                if row:
+                    _tbl_header_text += " ".join(str(c) if c else "" for c in row) + " "
+            if "catalog" in _tbl_header_text.lower() or "目录" in _tbl_header_text:
+                # 这是目录表格！逐行分析勾选状态
+                _checked_indicators = ['☑', '☒', '✓', '✔', '✅', '[x]', '[X]', '(x)', '(X)', '√', 'checked', 'yes']
+                _unchecked_indicators = ['☐', '□', '✗', '✖', '❌', '[ ]', '( )', '○', 'unchecked', 'no']
+                _t_checked = 0
+                _t_unchecked = 0
+                _t_items = []
+                for row in tbl[1:]:  # 跳过表头行
+                    if not row:
+                        continue
+                    row_text = " ".join(str(c) if c else "" for c in row)
+                    if not row_text.strip():
+                        continue
+                    # 判断此行的勾选状态
+                    _has_chk = any(ind in row_text for ind in _checked_indicators)
+                    _has_unchk = any(ind in row_text for ind in _unchecked_indicators)
+                    item_label = row_text[:60].strip()
+                    if _has_chk:
+                        _t_checked += 1
+                        _t_items.append({"item": item_label, "status": "✅ 已勾选"})
+                        result["checked_items"].append(item_label)
+                    else:
+                        _t_unchecked += 1
+                        _t_items.append({"item": item_label, "status": "❌ 未勾选"})
+                        result["unchecked_items"].append(item_label)
+                if _t_checked + _t_unchecked >= 3:  # 至少检测到3个目录项才采用表格结果
+                    result["checked_count"] = _t_checked
+                    result["unchecked_count"] = _t_unchecked
+                    result["total_items"] = _t_checked + _t_unchecked
+                    _catalog_from_table = True
+                    # 直接跳转到结果判定
+                    if _t_unchecked == 0 and _t_checked > 0:
+                        result["status"] = "✅ 全部已勾选"
+                        result["details"] = f"目录共{_t_checked}项，全部已勾选（表格检测）"
+                    elif _t_unchecked == result["total_items"]:
+                        result["status"] = "❌ NG - 目录全部未勾选"
+                        result["details"] = f"目录共{result['total_items']}项，**全部未勾选**（第{result['catalog_page_num']}页）"
+                        result["issues"].append(f"目录页（第{result['catalog_page_num']}页）：{result['total_items']}项全部未勾选")
+                    elif _t_unchecked > 0:
+                        result["status"] = f"⚠️ 部分未勾选（{_t_unchecked}/{result['total_items']}）"
+                        result["details"] = f"目录共{result['total_items']}项，已勾选{_t_checked}项，未勾选{_t_unchecked}项"
+                        result["issues"].append(f"目录页有{_t_unchecked}项未勾选")
+                    return result
 
     # 方法1：通过文本特征判断勾选状态
     # PDF中的checkbox可能以 ☑(checked) / ☐(unchecked) / ✓ / □ / [x] / [ ] 等形式出现
@@ -1379,8 +1536,13 @@ def run_full_inspection(file_path, file_name, standards):
     # 提取PDF并逐页分析（V4.0 核心）—— V5.2 优化：一次打开完成所有解析
     page_analysis, all_text, tables = analyze_pdf_page_by_page(file_path)
 
-    # 第零步：物料类型判定
-    mat_type, mat_type_cn, mat_kw, needs_elec = determine_material_type(file_name, standards)
+    # 第零步：物料类型判定 —— V5.5: 提取前3页文本作为内容提示辅助识别
+    _mat_hint = ""
+    for p in page_analysis[:min(3, len(page_analysis))]:
+        _mat_hint += p.get("text", "") + " "
+    mat_type, mat_type_cn, mat_kw, needs_elec = determine_material_type(
+        file_name, standards, pdf_content_hint=_mat_hint.strip()
+    )
 
     # 第一步：文件类型检查（V4.0新增）
     file_type, file_type_note = check_file_type(file_path, all_text)
@@ -1393,7 +1555,7 @@ def run_full_inspection(file_path, file_name, standards):
     validity = inspect_report_validity(page_analysis, standards, check_date)
 
     # V6.2 新增：目录勾选状态检测 + 料号跨表一致性检查
-    catalog_check = check_catalog_checkboxes(file_path, page_analysis)
+    catalog_check = check_catalog_checkboxes(file_path, page_analysis, tables=tables)  # V5.5: 传入预提取表格
     part_consistency = check_part_number_consistency(page_analysis, file_path, tables=tables)  # V5.4: 传入预提取表格
 
     # 第六步：生成最终结论
@@ -1999,7 +2161,7 @@ st.markdown("""
 3. **开始审核** — 点击按钮，等待审核完成
 4. **查看结果** — 展开每个文件的详细信息，下载Excel/Markdown报告
 
-### ⚙️ V5.4 版本说明（与SKILL.md同步）
+### ⚙️ V5.6 版本说明（与SKILL.md同步）
 | 功能 | 状态 |
 |------|--------|
 | 文件类型检查（DQM-001 vs DQM-002） | ✅ |
@@ -2022,8 +2184,14 @@ st.markdown("""
 | **文件上传去重（同名文件自动跳过）** | ✅ **V5.3新增** |
 | **彻底消除重复PDF打开（从5次→1次）** | ✅ **V5.4新增** |
 | **表格提取智能过滤（仅前30页+关键词页+限200行）** | ✅ **V5.4新增** |
-| **文本截断进一步压缩（50000→20000字符）** | ✅ **V5.4新增** |
 | **pdfplumber内存参数优化（关闭竖排检测）** | ✅ **V5.4新增** |
+| **目录表格检测修复（支持表格形式目录勾选识别）** | ✅ **V5.5新增** |
+| **物料类型智能识别（基于PDF内容辅助判定电子料/结构件）** | ✅ **V5.5新增** |
+| **CPK行标签格式检测（Cpk行右侧数值读取）** | ✅ **V5.6新增** |
+| **RoHS报告检测增强（扩展关键词+SGS识别+页面标记）** | ✅ **V5.6新增** |
+| **日期格式扩展（英文月份+中文日期+短格式）** | ✅ **V5.6新增** |
+| **前3页文本完整保留（封面信息不截断）** | ✅ **V5.6新增** |
+| **料号正则增强（支持K开头料号格式）** | ✅ **V5.6新增** |
 
 > 💡 **注意：** 本工具使用PDF文本解析技术进行自动化审核，部分内容（如图片中的尺寸标注、手写签名等）可能需要人工辅助确认。
 """)
