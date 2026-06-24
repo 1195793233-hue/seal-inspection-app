@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.8.1 修复版
+封样检验Web应用 - V5.8.2
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -1968,7 +1968,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.1: 修复正则group错误)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.2: 修复料号检测缩进错误)")
 
             progress = st.progress(0)
             detail_results = []
