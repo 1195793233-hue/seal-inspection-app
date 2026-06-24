@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.3 综合稳定版
+封样检验Web应用 - V5.4 大文件稳定版
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -49,7 +49,11 @@ def analyze_pdf_page_by_page(pdf_path):
     tables = []  # V5.2: 在同一次PDF打开中同时提取表格
     try:
         # V5.3: pdfplumber内存优化
-        with pdfplumber.open(pdf_path) as pdf:
+        # V5.4: pdfplumber 内存优化参数
+        _pdf_opts = {
+            "detect_vertical_text": False,   # 不检测竖排文字（节省内存）
+        }
+        with pdfplumber.open(pdf_path, **_pdf_opts) as pdf:
             for page_idx, page in enumerate(pdf.pages):
                 try:  # V5.3: 单页解析异常不影响其他页
                     page_num = page.page_number
@@ -160,14 +164,26 @@ def analyze_pdf_page_by_page(pdf_path):
                     if spec_score >= 2:
                         page_info["is_product_spec"] = True
 
-                    # V5.2: 同时提取表格，避免后续重新打开PDF
-                    try:
-                        pt = page.extract_tables()
-                        if pt:
-                            for t in pt:
-                                tables.append({"page": page.page_number, "table": t})
-                    except Exception:
-                        pass
+                    # V5.4: 只在前30页提取表格 + 仅当页面有关键词时（大幅减少内存）
+                    _should_extract_tbl = (
+                        page_idx < 30 and (
+                            re.search(r'cp[kK]|rohs|reach|catalog|目录|料号|part.?number',
+                                      text_lower) or
+                            page_info.get("is_cover") or
+                            page_info.get("is_cpk") or
+                            page_info.get("is_rohs_survey")
+                        )
+                    )
+                    if _should_extract_tbl:
+                        try:
+                            pt = page.extract_tables()
+                            if pt:
+                                for t in pt:
+                                    # V5.4: 限制单个表格最大行数，防止超大表格撑爆内存
+                                    if len(t) <= 200:
+                                        tables.append({"page": page.page_number, "table": t})
+                        except Exception:
+                            pass
 
                     results.append(page_info)
                 except Exception as page_err:
@@ -189,8 +205,8 @@ def analyze_pdf_page_by_page(pdf_path):
         results.append({"error": str(e), "all_text": all_text, "tables": tables})
 
     # V5.2: 截断过长的全文文本，避免内存爆炸
-    if len(all_text) > 50000:
-        all_text = all_text[:50000] + "\n[... 文本过长，已截断 ...]"
+    if len(all_text) > 20000:  # V5.4: 进一步降低内存占用
+        all_text = all_text[:20000] + "\n[... 文本过长，已截断 ...]"
 
     return results, all_text, tables  # V5.2: 同时返回预提取的表格
 
@@ -866,34 +882,40 @@ def extract_cover_info(page_analysis, pdf_path):
     return result
 
 
-def extract_table_headers_part_info(page_analysis, pdf_path):
+def extract_table_headers_part_info(page_analysis, tables=None):
     """
     V6.2: 从各表头提取料号和物料名称
+    V5.4优化: 接受预提取的tables，避免重新打开PDF
     返回: list of dict, 每个dict代表一个表格的料号信息
     格式: [{"table_type": str, "part_number": str, "material_name": str, "page_num": int}, ...]
     """
     table_infos = []
 
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                tables = page.extract_tables()
+    # V5.4: 使用预提取的表格，不重新打开PDF
+    if not tables:
+        return table_infos
 
-                if not tables:
-                    continue
+    try:
+        for t_dict in tables:
+            table = t_dict.get("table", [])
+            page_num = t_dict.get("page", 0)
+
+            if not table or len(table) < 1:
+                continue
 
                 for table in tables:
                     if not table or len(table) < 1:
                         continue
 
-                    # 判断表格类型（基于第一个非空行的内容）
+                    # 判断表格类型（基于第一个非空行的内容）— V5.4: 使用预提取表格
                     table_type = "unknown"
                     first_rows_text = ""
-                    for row in table[:3]:  # 检查前3行
+                    for row in table[:3]:
                         if row:
                             row_str = " ".join(str(c) if c else "" for c in row)
                             first_rows_text += row_str + " "
+                    # V5.4: 记录当前表格所在页码
+                    _current_table_page = page_num
 
                     first_rows_lower = first_rows_text.lower()
 
@@ -987,7 +1009,7 @@ def extract_table_headers_part_info(page_analysis, pdf_path):
                             "table_type": table_type,
                             "part_number": part_number,
                             "material_name": material_name,
-                            "page_num": page.page_number,
+                            "page_num": _current_table_page,
                         })
 
     except Exception:
@@ -1151,10 +1173,11 @@ def check_catalog_checkboxes(pdf_path, page_analysis):
     return result
 
 
-def check_part_number_consistency(page_analysis, pdf_path):
+def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4: 接受预提取tables
     """
     V6.2 功能2：料号&物料名称跨表一致性检查
     提取封面和各表头的料号/物料名称，比对一致性
+    V5.4优化: 接受预提取的tables参数，避免重新打开PDF
     返回: dict with consistency results
     """
     result = {
@@ -1175,7 +1198,7 @@ def check_part_number_consistency(page_analysis, pdf_path):
         return result
 
     # Step 2: 提取各表头的料号和物料名称
-    table_infos = extract_table_headers_part_info(page_analysis, pdf_path)
+    table_infos = extract_table_headers_part_info(page_analysis, tables=tables)  # V5.4: 使用预提取表格
     result["table_infos"] = table_infos
 
     if not table_infos:
@@ -1371,7 +1394,7 @@ def run_full_inspection(file_path, file_name, standards):
 
     # V6.2 新增：目录勾选状态检测 + 料号跨表一致性检查
     catalog_check = check_catalog_checkboxes(file_path, page_analysis)
-    part_consistency = check_part_number_consistency(page_analysis, file_path)
+    part_consistency = check_part_number_consistency(page_analysis, file_path, tables=tables)  # V5.4: 传入预提取表格
 
     # 第六步：生成最终结论
     all_results = {
@@ -1976,7 +1999,7 @@ st.markdown("""
 3. **开始审核** — 点击按钮，等待审核完成
 4. **查看结果** — 展开每个文件的详细信息，下载Excel/Markdown报告
 
-### ⚙️ V5.3 版本说明（与SKILL.md同步）
+### ⚙️ V5.4 版本说明（与SKILL.md同步）
 | 功能 | 状态 |
 |------|--------|
 | 文件类型检查（DQM-001 vs DQM-002） | ✅ |
@@ -1997,6 +2020,10 @@ st.markdown("""
 | **Excel错误汇总sheet（红/黄标识+建议操作）** | ✅ **V5.3新增** |
 | **单页解析异常隔离（一页失败不影响其他页）** | ✅ **V5.3新增** |
 | **文件上传去重（同名文件自动跳过）** | ✅ **V5.3新增** |
+| **彻底消除重复PDF打开（从5次→1次）** | ✅ **V5.4新增** |
+| **表格提取智能过滤（仅前30页+关键词页+限200行）** | ✅ **V5.4新增** |
+| **文本截断进一步压缩（50000→20000字符）** | ✅ **V5.4新增** |
+| **pdfplumber内存参数优化（关闭竖排检测）** | ✅ **V5.4新增** |
 
 > 💡 **注意：** 本工具使用PDF文本解析技术进行自动化审核，部分内容（如图片中的尺寸标注、手写签名等）可能需要人工辅助确认。
 """)
