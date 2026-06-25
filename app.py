@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.8.4
+封样检验Web应用 - V5.8.5
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -810,19 +810,71 @@ def inspect_rohs_compliance(page_analysis, standards, check_date):
     missing_fields = []
     for field_name, keywords in red_box_fields:
         found = False
+        # V5.8.5：先在RoHS调查表页文本中查找
         for p in rohs_survey_pages:
             txt = p.get("text", "")
-            # V5.7：使用更宽松的子串匹配（关键词只需出现在文本中任意位置）
-            if any(kw.lower() in txt.lower() for kw in keywords):
+            txt_lower = txt.lower()
+            # V5.7：使用更宽松的子串匹配
+            if any(kw.lower() in txt_lower for kw in keywords):
                 found = True
                 break
-        if not found:
-            # V5.7：在全文中再查一次，且使用拆分词匹配
+            # V5.8.5增强：多词关键字拆分匹配（如 "effective date" → "effective" 和 "date" 都需出现）
             for kw in keywords:
-                # 拆分多词关键词为单词级别匹配
                 kw_words = kw.lower().split()
                 if len(kw_words) >= 2:
-                    # 多词关键词：每个词都需要出现（允许中间有其他文字）
+                    all_words_found = all(w in txt_lower for w in kw_words if len(w) > 1)
+                    if all_words_found:
+                        found = True
+                        break
+                else:
+                    if kw.lower() in txt_lower:
+                        found = True
+                        break
+            if found:
+                break
+
+        # V5.8.5：如果页面文本未找到，在RoHS表格中直接搜索（表格提取更准确）
+        if not found and tables:
+            for t_dict in tables:
+                tbl = t_dict.get("table", [])
+                tbl_page = t_dict.get("page", 0)
+                if not tbl:
+                    continue
+                # 只检查RoHS相关表格（前30页内）
+                tbl_preview = ""
+                for row in tbl[:2]:
+                    if row:
+                        tbl_preview += " ".join(str(c) if c else "" for c in row) + " "
+                if "rohs" not in tbl_preview.lower():
+                    continue
+                # 在所有单元格中搜索关键词
+                for row in tbl:
+                    if not row:
+                        continue
+                    for cell in row:
+                        if cell is None:
+                            continue
+                        cell_str = str(cell).strip().lower()
+                        if any(kw.lower() in cell_str for kw in keywords):
+                            found = True
+                            break
+                        # 多词拆分匹配
+                        for kw in keywords:
+                            kw_words = kw.lower().split()
+                            if len(kw_words) >= 2:
+                                if all(w in cell_str for w in kw_words if len(w) > 1):
+                                    found = True
+                                    break
+                    if found:
+                        break
+                if found:
+                    break
+
+        # V5.8.5：最后在全文中兜底搜索
+        if not found:
+            for kw in keywords:
+                kw_words = kw.lower().split()
+                if len(kw_words) >= 2:
                     all_words_found = all(w in all_text_lower for w in kw_words if len(w) > 1)
                     if all_words_found:
                         found = True
@@ -1009,58 +1061,141 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
             ]
         )]
 
-    for p in cover_pages:
-        text = p.get("text", "")
-        if not text:
-            continue
+    # V5.8.5 新增：优先从封面表格中提取（表格格式封面比文本提取更准确）
+    _cover_page_nums = set(p.get("page_num", 0) for p in cover_pages)
+    if tables and (not result["part_number"] or not result["material_name"]):
+        for t_dict in tables:
+            tbl_page = t_dict.get("page", 0)
+            if tbl_page > 5:  # 只搜索前5页的表格
+                continue
+            tbl = t_dict.get("table", [])
+            if not tbl or len(tbl) < 2:
+                continue
+            # 检查是否为样品承认书/封面类表格
+            _tbl_preview = ""
+            for row in tbl[:3]:
+                if row:
+                    _tbl_preview += " ".join(str(c) if c else "" for c in row) + " "
+            _is_ack_tbl = any(kw in _tbl_preview.lower() for kw in [
+                "sample acknowledgement", "样品承认书", "product name",
+                "material number", "产品名称", "物料编号", "supplier product model"
+            ])
+            if not _is_ack_tbl:
+                continue
+            # 逐行扫描表格，找 "Product name" / "产品名称" 标签行，取同行下一个非空单元格作为值
+            for row_idx, row in enumerate(tbl):
+                if not row:
+                    continue
+                row_str = " ".join(str(c) if c else "" for c in row)
+                # 查找料号：Material number 行
+                for ci, cell in enumerate(row):
+                    if cell is None:
+                        continue
+                    cell_str = str(cell).strip()
+                    # 料号匹配：K+数字 格式 或 Material number 标签行
+                    if not result["part_number"]:
+                        pn_in_cell = re.search(r'(K\d{6,}[A-Za-z]*)', cell_str)
+                        if pn_in_cell:
+                            result["part_number"] = pn_in_cell.group(1).strip()
+                            result["page_num"] = tbl_page
+                        elif re.search(r'material\s*(number|no\.?)|物料编号|part\s*number', cell_str, re.IGNORECASE):
+                            # 标签单元格，值在右侧相邻单元格
+                            for nc in row[ci+1:]:
+                                if nc is not None and str(nc).strip():
+                                    nv = re.search(r'(K\d{6,}[A-Za-z]*)', str(nc).strip())
+                                    if nv:
+                                        result["part_number"] = nv.group(1).strip()
+                                        result["page_num"] = tbl_page
+                                    break
 
-        lines = text.split('\n')
-        for i, line in enumerate(lines):
-            line_stripped = line.strip()
+                    # 物料名称匹配：Product name / 产品名称 标签行
+                    if not result["material_name"]:
+                        if re.search(r'product\s*name|产品名称', cell_str, re.IGNORECASE):
+                            # 标签单元格，值在右侧相邻单元格
+                            for nc in row[ci+1:]:
+                                if nc is not None and str(nc).strip():
+                                    name_candidate = str(nc).strip()
+                                    # 过滤：不能是标签文字、长度合理
+                                    _bad_kw = ['supplier', 'model', 'number', 'remark',
+                                               'version', 'description', '规格', '日期',
+                                               'rev', '料号', '物料', '编号']
+                                    _nc_lower = name_candidate.lower()
+                                    if (len(name_candidate) >= 2 and len(name_candidate) <= 60
+                                            and not any(k in _nc_lower for k in _bad_kw)
+                                            and not name_candidate.isdigit()):
+                                        result["material_name"] = name_candidate
+                                        result["page_num"] = tbl_page
+                                    break
+                        elif re.search(r'supplier\s*product\s*model|供應商產品型號|供应商产品型号|型号', cell_str, re.IGNORECASE):
+                            for nc in row[ci+1:]:
+                                if nc is not None and str(nc).strip():
+                                    name_candidate = str(nc).strip()
+                                    _bad_kw = ['supplier', 'model', 'number', 'remark', 'version']
+                                    if (len(name_candidate) >= 2 and len(name_candidate) <= 50
+                                            and not any(k in name_candidate.lower() for k in _bad_kw)
+                                            and not name_candidate.isdigit()):
+                                        result["material_name"] = name_candidate
+                                        result["page_num"] = tbl_page
+                                    break
 
-            # 提取料号（多种格式，V5.6增强）
-            # 注意：patterns仅用于文档说明，实际匹配在下面单独进行
+                if result["part_number"] and result["material_name"]:
+                    break
+            if result["part_number"] and result["material_name"]:
+                break
 
-            # 料号匹配（V5.6增强：支持冒号/等号/括号等多种分隔符）
-            pn_match = re.search(
-                r'(?:Material\s*(?:number|No\.?|编号)?|物料编号|Part\s*Number[\(（]?料号[\)）]?|料号[\/\s]*:?|零件号)[\s:：()（）\-*]*([A-Za-z0-9][A-Za-z0-9_\-]*)',
-                line, re.IGNORECASE
-            )
-            # V5.6额外尝试：直接匹配 K+数字 字母混合格式（常见料号格式）
-            if not pn_match:
+    # 传统方式：从文字行提取（当表格提取未成功时）
+    if not result["part_number"] or not result["material_name"]:
+        for p in cover_pages:
+            text = p.get("text", "")
+            if not text:
+                continue
+
+            lines = text.split('\n')
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+
+                # 提取料号（多种格式，V5.6增强）
+                # 注意：patterns仅用于文档说明，实际匹配在下面单独进行
+
+                # 料号匹配（V5.6增强：支持冒号/等号/括号等多种分隔符）
                 pn_match = re.search(
-                    r'\b(K\d+[A-Za-z]*)\b',  # 如 K6970000223LA
-                    line
-                )
-            if pn_match and not result["part_number"]:
-                result["part_number"] = pn_match.group(1).strip()
-                result["page_num"] = p["page_num"]
-
-            # 物料名称匹配（V5.8.3修复：优先Product name，回退Supplier Product Model）
-            # 关键改进：
-            # 1. 用 (.+?) 非贪婪匹配 + 长度限制 {3,60}
-            # 2. 排除包含表头标签关键词的结果
-            _label_keywords = ['supplier', 'model', 'number', 'remark', 'material',
-                               'version', 'description', '规格', '日期', 'date',
-                               'rev', '料号', '物料', '编号', '版本']
-            name_match = re.search(
-                r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*(.+?)\s{2,}',
-                line, re.IGNORECASE
-            )
-            if not name_match:
-                # 备用：匹配到行尾，但限制长度
-                name_match = re.search(
-                    r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*([^\n\r]{3,60})',
+                    r'(?:Material\s*(?:number|No\.?|编号)?|物料编号|Part\s*Number[\(（]?料号[\)）]?|料号[\/\s]*:?|零件号)[\s:：()（）\-*]*([A-Za-z0-9][A-Za-z0-9_\-]*)',
                     line, re.IGNORECASE
                 )
-            if name_match and not result["material_name"]:
-                name_val = name_match.group(1).strip()
-                name_lower = name_val.lower()
-                _is_label_like = any(kw in name_lower for kw in _label_keywords)
-                if (len(name_val) >= 3 and not name_val.isdigit()
-                        and not _is_label_like
-                        and len(name_val) <= 60):
-                    result["material_name"] = name_val
+                # V5.6额外尝试：直接匹配 K+数字 字母混合格式（常见料号格式）
+                if not pn_match:
+                    pn_match = re.search(
+                        r'\b(K\d+[A-Za-z]*)\b',  # 如 K6970000223LA
+                        line
+                    )
+                if pn_match and not result["part_number"]:
+                    result["part_number"] = pn_match.group(1).strip()
+                    result["page_num"] = p["page_num"]
+
+                # 物料名称匹配（V5.8.3修复：优先Product name，回退Supplier Product Model）
+                _label_keywords = ['supplier', 'model', 'number', 'remark', 'material',
+                                   'version', 'description', '规格', '日期', 'date',
+                                   'rev', '料号', '物料', '编号', '版本']
+                name_match = re.search(
+                    r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*(.+?)\s{2,}',
+                    line, re.IGNORECASE
+                )
+                if not name_match:
+                    name_match = re.search(
+                        r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*([^\n\r]{3,60})',
+                        line, re.IGNORECASE
+                    )
+                if name_match and not result["material_name"]:
+                    name_val = name_match.group(1).strip()
+                    name_lower = name_val.lower()
+                    _is_label_like = any(kw in name_lower for kw in _label_keywords)
+                    if (len(name_val) >= 3 and not name_val.isdigit()
+                            and not _is_label_like
+                            and len(name_val) <= 60):
+                        result["material_name"] = name_val
+
+            if result["part_number"] or result["material_name"]:
+                break
 
         # V5.8.3增强：如果Product name未提取到，尝试从Supplier Product Model字段提取
         if not result["material_name"]:
@@ -1070,7 +1205,6 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                     continue
                 lines = text.split('\n')
                 for line in lines:
-                    # 匹配 Supplier Product Model / 供應商產品型號 / 型号 等字段的值
                     spm_match = re.search(
                         r'(?:Supplier\s*Product\s*Model|供應商產品型號?|供应商产品型号?|型号)[^:\w]*[\s:：]*([A-Za-z0-9_\-&+\u4e00-\u9fff]{2,50})',
                         line, re.IGNORECASE
@@ -1085,9 +1219,6 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                             break
                 if result["material_name"]:
                     break
-
-        if result["part_number"] or result["material_name"]:
-            break
 
     # V5.7增强：封面页为图片(无文字)或提取失败时，从前10页表格中搜索料号和物料名称
     if (not result["part_number"] or not result["material_name"]) and tables:
@@ -1545,16 +1676,25 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4
     table_infos = extract_table_headers_part_info(page_analysis, tables=tables)  # V5.4: 使用预提取表格
     result["table_infos"] = table_infos
 
-    if not table_infos:
+    # V5.8.5：过滤掉外部检测报告（SGS/华测等），只对比文档内部表格
+    # 外部报告的料号格式可能与内部不同，不具备可比性
+    _external_report_types = {"RoHS测试报告", "REACH报告", "CPK报告"}
+    _internal_table_infos = [
+        ti for ti in table_infos if ti.get("table_type", "unknown") not in _external_report_types
+    ]
+    # 同时记录被排除的外部报告（用于信息展示）
+    _excluded_count = len(table_infos) - len(_internal_table_infos)
+
+    if not _internal_table_infos:
         result["overall_status"] = "⚠️ 未检测到其他表格的表头信息"
-        result["issues"].append("未在各报告表头中找到料号/物料名称信息")
+        result["issues"].append("未在各报告表头中找到料号/物料名称信息（已排除外部检测报告）")
         return result
 
-    # Step 3: 逐一比对
+    # Step 3: 逐一比对（仅对比内部表格）
     ref_pn = cover["part_number"]
     ref_name = cover["material_name"]
 
-    for ti in table_infos:
+    for ti in _internal_table_infos:
         table_type = ti["table_type"]
         table_pn = ti["part_number"]
         table_name = ti["material_name"]
@@ -2062,7 +2202,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.4: 料号一致性改对比料号+Excel详情+封面回退)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.5: 物料名称表格提取+RoHS日期+料号排除外部报告)")
 
             progress = st.progress(0)
             detail_results = []
