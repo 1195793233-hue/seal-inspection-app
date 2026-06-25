@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.8.5
+封样检验Web应用 - V5.8.6
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -452,7 +452,8 @@ def extract_cpk_values(text, tables=None):
 
     def add_val(v):
         """去重添加CPK值"""
-        if v not in seen and 0 <= v <= 100:  # 合理的CPK范围
+        # V5.8.5: 提高下限从0到0.30，避免误提取公差/偏差等小数值
+        if v not in seen and 0.30 <= v <= 100:  # 合理的CPK范围
             seen.add(v)
             cpk_values.append(v)
 
@@ -466,7 +467,9 @@ def extract_cpk_values(text, tables=None):
         # V6.1 新增：宽松相邻匹配
         r'cp[kK]\s*[\/>]?\s*(\d+\.\d{1,2})',     # CPK>1.33 / CPK/1.33 / CPK 1.33
         r'cp[kK]\s+(?:最小|min|minimum)?\s*[:：]?\s*(\d+\.\d+)',  # CPK最小: 1.33
-        r'(?:cpk|Cpk|CPK)\s.*?(\d+\.\d{2})',      # CPK xxx 1.33（同一行内）
+        # V5.8.5修复：此模式在全文搜索，可能跨行误匹配非CPK数字
+        # 改为逐行匹配，且要求CPK和数值在同一行内紧密相邻
+        # r'(?:cpk|Cpk|CPK)\s.*?(\d+\.\d{2})',  # 已移除：过于宽泛
     ]
     for pattern in text_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
@@ -498,26 +501,23 @@ def extract_cpk_values(text, tables=None):
                             data_row = table[data_row_idx]
                             if data_row is None:
                                 continue
+                            # V5.8.5修复：只提取纯数字单元格，避免从备注/说明文字中误提取嵌入数字
                             for col_idx in cpk_col_indices:
                                 cell_val = data_row[col_idx] if col_idx < len(data_row) else None
                                 if cell_val is not None:
                                     val_str = str(cell_val).strip()
+                                    # 只接受纯数字（不含其他文字）
                                     num_match = re.match(r'^(\d+\.?\d*)$', val_str)
                                     if num_match:
                                         try:
                                             add_val(float(num_match.group(1)))
                                         except ValueError:
                                             pass
-                                    elif re.search(r'\d+\.\d{1,2}', val_str):
-                                        nums = re.findall(r'\d+\.\d{1,2}', val_str)
-                                        for n in nums:
-                                            try:
-                                                add_val(float(n))
-                                            except ValueError:
-                                                pass
+                                    # V5.8.5: 移除原来的 elif 分支（会从备注/说明中提取嵌入数字如0.5）
                         break
 
             # 额外：扫描整个表格中的CPK数值模式
+            # V5.8.5: 只从纯数字或明确键值对格式的单元格中提取
             for row in table:
                 if row is None:
                     continue
@@ -525,7 +525,8 @@ def extract_cpk_values(text, tables=None):
                     if cell is None:
                         continue
                     cell_str = str(cell).strip()
-                    m = re.search(r'cp[kK]\s*[:：=]?\s*(\d+\.?\d*)', cell_str, re.IGNORECASE)
+                    # 只匹配明确的 CPK:1.33 格式，不匹配嵌入数字
+                    m = re.match(r'^[Cc]p[kK]\s*[:：=]\s*(\d+\.?\d*)$', cell_str, re.IGNORECASE)
                     if m:
                         try:
                             add_val(float(m.group(1)))
@@ -552,38 +553,36 @@ def extract_cpk_values(text, tables=None):
                         val = row_strs[col_idx].strip()
                         if not val:
                             continue
-                        # 纯数字
+                        # V5.8.5: 只接受纯数字单元格
                         num_match = re.match(r'^(\d+\.?\d*)$', val)
                         if num_match:
                             try:
                                 v = float(num_match.group(1))
-                                if 0 <= v <= 100:
+                                if 0.30 <= v <= 100:
                                     add_val(v)
                             except ValueError:
                                 pass
-                        # 嵌入数字
-                        elif re.search(r'\d+\.\d{1,2}', val):
-                            nums = re.findall(r'\d+\.\d{1,2}', val)
-                            for n in nums:
-                                try:
-                                    add_val(float(n))
-                                except ValueError:
-                                    pass
+                        # V5.8.5: 移除原来的 elif 嵌入数字提取分支
 
-    # ===== 方法3：多行统计摘要匹配 =====
-    # 匹配类似 "CPK  0.67  3.84  4.00" 这种同行多值格式
-    multi_cpk_pattern = r'cp[kK][\s\:：]*([0-9.]+(?:\s+[0-9.]+)*)'
-    multi_matches = re.findall(multi_cpk_pattern, text, re.IGNORECASE)
-    for match_group in multi_matches:
-        numbers = re.findall(r'(\d+\.\d{1,2})', match_group)
-        for n in numbers:
-            try:
-                v = float(n)
-                # 过滤掉明显不是CPK值的数（如尺寸值>100或过小的噪声值<0.01）
-                if 0.01 <= v <= 20:
-                    add_val(v)
-            except ValueError:
-                continue
+    # ===== 方法3：逐行统计摘要匹配（V5.8.5修复：改为逐行匹配，避免跨行误提取）=====
+    # 匹配类似 "CPK  0.67  3.84  4.00" 或 "Cpk 1.36 1.49 2.44 2.93 1.91"
+    # V5.8.5 关键修复：原逻辑在全文上做正则，会把非CPK行的数字（如公差0.10）误当CPK值
+    _cpk_line_pattern = r'^.*\bcp[kK]\b[\s\:：]*([0-9.]+\s*(?:[0-9.]+\s*)*)'
+    for text_line in text.split('\n'):
+        text_line_stripped = text_line.strip()
+        _line_match = re.search(_cpk_line_pattern, text_line_stripped, re.IGNORECASE)
+        if _line_match:
+            _match_group = _line_match.group(1)
+            # 只从该行提取数字
+            numbers = re.findall(r'(\d+\.\d{1,2})', _match_group)
+            for n in numbers:
+                try:
+                    v = float(n)
+                    # V5.8.5: 提高最小阈值（CPK值通常>=0.30；<0.3的多为噪声如公差、偏差等）
+                    if 0.30 <= v <= 20:
+                        add_val(v)
+                except ValueError:
+                    continue
 
     return cpk_values
 
@@ -2202,7 +2201,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.5: 物料名称表格提取+RoHS日期+料号排除外部报告)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.6: 修复CPK值误提取公差/备注数字)")
 
             progress = st.progress(0)
             detail_results = []
