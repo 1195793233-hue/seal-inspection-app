@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.8.3
+封样检验Web应用 - V5.8.4
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -1036,10 +1036,10 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                 result["part_number"] = pn_match.group(1).strip()
                 result["page_num"] = p["page_num"]
 
-            # 物料名称匹配（V5.8.2修复：限制贪婪匹配，避免捕获表头标签文字）
+            # 物料名称匹配（V5.8.3修复：优先Product name，回退Supplier Product Model）
             # 关键改进：
             # 1. 用 (.+?) 非贪婪匹配 + 长度限制 {3,60}
-            # 2. 排除包含表头关键词的结果（Supplier/Model/Number/Remark/物料/料号等）
+            # 2. 排除包含表头标签关键词的结果
             _label_keywords = ['supplier', 'model', 'number', 'remark', 'material',
                                'version', 'description', '规格', '日期', 'date',
                                'rev', '料号', '物料', '编号', '版本']
@@ -1056,12 +1056,35 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
             if name_match and not result["material_name"]:
                 name_val = name_match.group(1).strip()
                 name_lower = name_val.lower()
-                # V5.8.2：过滤掉太短、纯数字、或包含表头标签关键词的值
                 _is_label_like = any(kw in name_lower for kw in _label_keywords)
                 if (len(name_val) >= 3 and not name_val.isdigit()
                         and not _is_label_like
                         and len(name_val) <= 60):
                     result["material_name"] = name_val
+
+        # V5.8.3增强：如果Product name未提取到，尝试从Supplier Product Model字段提取
+        if not result["material_name"]:
+            for p in cover_pages:
+                text = p.get("text", "")
+                if not text:
+                    continue
+                lines = text.split('\n')
+                for line in lines:
+                    # 匹配 Supplier Product Model / 供應商產品型號 / 型号 等字段的值
+                    spm_match = re.search(
+                        r'(?:Supplier\s*Product\s*Model|供應商產品型號?|供应商产品型号?|型号)[^:\w]*[\s:：]*([A-Za-z0-9_\-&+\u4e00-\u9fff]{2,50})',
+                        line, re.IGNORECASE
+                    )
+                    if spm_match:
+                        candidate = spm_match.group(1).strip()
+                        _spm_label_kw = ['supplier', 'model', 'number', 'remark', 'version']
+                        if (len(candidate) >= 2 and len(candidate) <= 50
+                                and not any(k in candidate.lower() for k in _spm_label_kw)
+                                and not candidate.isdigit()):
+                            result["material_name"] = candidate
+                            break
+                if result["material_name"]:
+                    break
 
         if result["part_number"] or result["material_name"]:
             break
@@ -1595,15 +1618,24 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4
 
         result["consistency_checks"].append(check_result)
 
-    # 判定整体状态
-    has_mismatch = any("❌" in str(c.get("pn_match", "")) or "❌" in str(c.get("name_match", ""))
-                       for c in result["consistency_checks"])
-    has_minor_diff = any("⚠️" in str(c.get("pn_match", "")) or "⚠️" in str(c.get("name_match", ""))
-                         for c in result["consistency_checks"])
+    # V5.8.3 修复：判定整体状态
+    # 料号一致性检查的核心是**料号(Part Number)**的一致性，物料名称仅作参考
+    # 只有料号不一致才判定为❌不合格；物料名称不一致仅记录为⚠️警告
+    has_pn_mismatch = any("❌" in str(c.get("pn_match", "")) for c in result["consistency_checks"])
+    has_pn_minor = any("⚠️" in str(c.get("pn_match", "")) for c in result["consistency_checks"])
+    has_name_mismatch = any("❌" in str(c.get("name_match", "")) for c in result["consistency_checks"])
+    has_name_minor = any("⚠️" in str(c.get("name_match", "")) for c in result["consistency_checks"])
 
-    if has_mismatch:
+    # 将物料名称的❌降级为⚠️警告（物料名称在不同表格中可能有合理差异）
+    if has_name_mismatch:
+        for issue in list(result["issues"]):
+            if "物料名称" in issue or "产品名称" in issue:
+                result["issues"].remove(issue)
+                result["issues"].append(issue.replace("❌", "⚠️").replace("不一致", "存在差异(参考)"))
+
+    if has_pn_mismatch:
         result["overall_status"] = "❌ 存在不一致"
-    elif has_minor_diff:
+    elif has_pn_minor or has_name_mismatch:
         result["overall_status"] = "⚠️ 基本一致（有微小差异）"
     else:
         result["overall_status"] = "✅ 全部一致"
@@ -1694,6 +1726,23 @@ def generate_final_verdict(material_type, all_results, standards):
 # 主审核流程（V4.0 完整8步）
 # ============================================================
 
+def _build_detail_str(sub_items, extra_values):
+    """
+    V5.8.3: 从sub_items和额外值构建详情字符串（用于Excel汇总表）
+    将检查项的子结果合并为可读的摘要字符串
+    """
+    parts = []
+    if sub_items:
+        for k, v in list(sub_items.items())[:5]:  # 最多取前5个子项
+            if isinstance(v, str) and v.strip():
+                # 截断过长的值
+                short_v = v[:50] + "..." if len(v) > 50 else v
+                parts.append(f"{short_v}")
+    if extra_values:
+        parts.append(f"值:{extra_values}")
+    return " | ".join(parts) if parts else ""
+
+
 def run_full_inspection(file_path, file_name, standards):
     """执行完整的V4.0 6大类审核流程（含PDF逐页分析）"""
     check_date = datetime.now()
@@ -1763,8 +1812,14 @@ def run_full_inspection(file_path, file_name, standards):
         "文件完整性": completeness["status"],
         "RoHS合规性": rohs["overall_status"],
         "CPK合规性": cpk["overall_status"],
+        # V5.8.3: 增加CPK详情
+        "CPK详情": _build_detail_str(cpk.get("sub_items", {}), cpk.get("cpk_values", [])),
         "尺寸对应性": dimension["overall_status"],
+        # V5.8.3: 增加尺寸详情
+        "尺寸详情": _build_detail_str(dimension.get("sub_items", {}), []),
         "报告时效性": validity["overall_status"],
+        # V5.8.3: 增加报告时效详情
+        "时效详情": _build_detail_str(validity.get("sub_items", {}), []),
         # V6.2 新增
         "目录勾选状态": catalog_check.get("status", "⏱ 未检测"),
         "料号一致性": part_consistency.get("overall_status", "⏱ 未检测"),
@@ -2007,7 +2062,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.3: 修复封面物料名称提取错误)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.4: 料号一致性改对比料号+Excel详情+封面回退)")
 
             progress = st.progress(0)
             detail_results = []
