@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.8.2
+封样检验Web应用 - V5.8.3
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -1036,22 +1036,38 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                 result["part_number"] = pn_match.group(1).strip()
                 result["page_num"] = p["page_num"]
 
-            # 物料名称匹配
+            # 物料名称匹配（V5.8.2修复：限制贪婪匹配，避免捕获表头标签文字）
+            # 关键改进：
+            # 1. 用 (.+?) 非贪婪匹配 + 长度限制 {3,60}
+            # 2. 排除包含表头关键词的结果（Supplier/Model/Number/Remark/物料/料号等）
+            _label_keywords = ['supplier', 'model', 'number', 'remark', 'material',
+                               'version', 'description', '规格', '日期', 'date',
+                               'rev', '料号', '物料', '编号', '版本']
             name_match = re.search(
-                r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*(.+)',
+                r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*(.+?)\s{2,}',
                 line, re.IGNORECASE
             )
+            if not name_match:
+                # 备用：匹配到行尾，但限制长度
+                name_match = re.search(
+                    r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*([^\n\r]{3,60})',
+                    line, re.IGNORECASE
+                )
             if name_match and not result["material_name"]:
                 name_val = name_match.group(1).strip()
-                # 过滤掉太短或不像名称的值
-                if len(name_val) >= 3 and not name_val.isdigit():
+                name_lower = name_val.lower()
+                # V5.8.2：过滤掉太短、纯数字、或包含表头标签关键词的值
+                _is_label_like = any(kw in name_lower for kw in _label_keywords)
+                if (len(name_val) >= 3 and not name_val.isdigit()
+                        and not _is_label_like
+                        and len(name_val) <= 60):
                     result["material_name"] = name_val
 
         if result["part_number"] or result["material_name"]:
             break
 
-    # V5.7增强：封面页为图片(无文字)时，从前10页表格中搜索料号
-    if not result["part_number"] and tables:
+    # V5.7增强：封面页为图片(无文字)或提取失败时，从前10页表格中搜索料号和物料名称
+    if (not result["part_number"] or not result["material_name"]) and tables:
         import re as _re
         for t_dict in tables:
             tbl_page = t_dict.get("page", 0)
@@ -1060,6 +1076,16 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
             tbl = t_dict.get("table", [])
             if not tbl:
                 continue
+            # 检查是否为封面/样品承认书表格（优先从这类表格提取）
+            _tbl_text = ""
+            for row in tbl[:3]:
+                if row:
+                    _tbl_text += " ".join(str(c) if c else "" for c in row) + " "
+            _is_cover_tbl = any(kw in _tbl_text.lower() for kw in [
+                "sample acknowledgement", "样品承认书", "product name",
+                "material number", "产品名称", "物料编号"
+            ])
+
             # 在表格中搜索 K+数字 字母格式（如 K6970000223LA）
             for row in tbl:
                 if not row:
@@ -1068,22 +1094,35 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                     if cell is None:
                         continue
                     cell_str = str(cell).strip()
-                    pn_match = _re.search(r'(K\d{6,}[A-Za-z]*)', cell_str)  # K+至少6位数字+可选字母后缀
+                    # 提取料号
+                    pn_match = _re.search(r'(K\d{6,}[A-Za-z]*)', cell_str)
                     if pn_match and not result["part_number"]:
                         result["part_number"] = pn_match.group(1).strip()
                         result["page_num"] = tbl_page
-                    # 同时尝试提取物料名称
-                    name_patterns = [
-                        r'(?:Part Name|零件名称|产品名称|Description)[^:\w]*[\s:：]*([A-Za-z0-9\-一-鿿]+)',
-                    ]
-                    for npat in name_patterns:
-                        nm = _re.search(npat, cell_str, _re.IGNORECASE)
-                        if nm and len(nm.group(1)) >= 3 and not result["material_name"]:
-                            result["material_name"] = nm.group(1).strip()
+                    # V5.8.2增强：提取物料名称（支持中英文名称）
+                    if not result["material_name"] and _is_cover_tbl:
+                        # 匹配常见物料名称格式（如 S1652_FPC连接器泡棉）
+                        _name_patterns = [
+                            r'^([A-Za-z0-9_\-&+\u4e00-\u9fff]{4,40})$',  # 独立的名称单元格
+                            r'(?:Product\s*name|产品名称|Part\s*Name|零件名称)[^:\w]*[\s:：]*([\w\u4e00-\u9fff\-_&+]{2,40})',
+                            r'(?:Supplier\s*Product\s*Model|供应商品号型号|型号)[^:\w]*[\s:：]*([\w\u4e00-\u9fff\-_&+]{2,40})',
+                        ]
+                        for _np in _name_patterns:
+                            _nm = _re.search(_np, cell_str, _re.IGNORECASE)
+                            if _nm:
+                                _candidate = _nm.group(1).strip()
+                                # 过滤掉标签类文字
+                                _label_kw = ['supplier', 'model', 'number', 'remark',
+                                            'material', 'version', 'description']
+                                if (len(_candidate) >= 2 and len(_candidate) <= 50
+                                        and not any(k in _candidate.lower() for k in _label_kw)
+                                        and not _candidate.isdigit()):
+                                    result["material_name"] = _candidate
+                                    break
 
-                if result["part_number"]:
+                if result["part_number"] and result["material_name"]:
                     break
-            if result["part_number"]:
+            if result["part_number"] and result["material_name"]:
                 break
 
     return result
@@ -1968,7 +2007,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.2: 修复料号检测缩进错误)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.3: 修复封面物料名称提取错误)")
 
             progress = st.progress(0)
             detail_results = []
