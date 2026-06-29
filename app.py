@@ -736,9 +736,10 @@ def inspect_file_completeness_v4(page_analysis, material_type, standards):
     return results
 
 
-def inspect_rohs_compliance(page_analysis, standards, check_date):
+def inspect_rohs_compliance(page_analysis, standards, check_date, tables=None):
     """
     第二类：RoHS合规性检验（4子项）
+    V5.8.7修复: 新增tables参数，支持从预提取表格中搜索红框字段
     """
     results = {
         "sub_items": {},
@@ -2081,7 +2082,7 @@ def run_full_inspection(file_path, file_name, standards):
 
     # 第二步~第五步：各类检验（基于逐页分析结果）
     completeness = inspect_file_completeness_v4(page_analysis, mat_type, standards)
-    rohs = inspect_rohs_compliance(page_analysis, standards, check_date)
+    rohs = inspect_rohs_compliance(page_analysis, standards, check_date, tables=tables)
     cpk = inspect_cpk_compliance(page_analysis, standards, all_text, tables=tables)
     dimension = inspect_dimension_correspondence(page_analysis, standards)
     validity = inspect_report_validity(page_analysis, standards, check_date)
