@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.8.6
+封样检验Web应用 - V5.8.7
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -1283,7 +1283,12 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
 
 def extract_table_headers_part_info(page_analysis, tables=None):
     """
-    V6.2: 从各表头提取料号和物料名称
+    V5.8.7: 从各表头提取料号和物料名称（大幅改进）
+    改进点：
+    1. 跳过表头标签行（含多个label关键词的行）
+    2. 识别并跳过非目标字段（供应商名/版本号/项目名/供应商料号等）
+    3. 处理跨单元格料号拆分（pdfplumber可能将长料号拆为多个单元格）
+    4. 物料名称必须包含中文或下划线格式（排除纯英文短值如S0521/V1.0）
     V5.4优化: 接受预提取的tables，避免重新打开PDF
     返回: list of dict, 每个dict代表一个表格的料号信息
     格式: [{"table_type": str, "part_number": str, "material_name": str, "page_num": int}, ...]
@@ -1293,6 +1298,45 @@ def extract_table_headers_part_info(page_analysis, tables=None):
     # V5.4: 使用预提取的表格，不重新打开PDF
     if not tables:
         return table_infos
+
+    # === V5.8.7: 表头标签关键词（用于检测和跳过表头行）===
+    _header_label_keywords = {
+        'supplier', 'model', 'number', 'remark', 'material', 'version',
+        'description', '规格', '日期', 'date', 'rev', '料号', '物料',
+        '编号', '版本', '零件', 'name', 'part', 'item', '数量', 'unit',
+        '单位', '是', '否', 'rohs', 'note', '注意', 'vendor', 'tool',
+        '模号', '穴数', 'cav', 'revision', 'sign', '签署', 'department',
+        '部门', 'producer', '制作人', 'status', 'state', '承认'
+    }
+
+    # === V5.8.7: 非料号字段关键词（这些字段的值不应被当作料号提取）===
+    _non_pn_field_labels = {
+        'supplier', 'vendor', '供应商', 'tool number', '模号',
+        'revision', 'rev', '版本', 'cavity', '穴数', 'date', '日期',
+        'inspected', '确认者', 'comments', '签字', 'sign', 'unit', '单位',
+        'supplier p/n', '供应商料号', 'supplier model', '供应商型号',
+        'project name', '项目名称', 'tp fw', 'camera firmware', '摄像头'
+    }
+
+    # === V5.8.7: 非物料名称字段关键词 ===
+    _non_name_field_labels = {
+        'project name', '项目名称', 'tp fw', '量产版本', 'camera firmware',
+        '摄像头code', 'revision', 'rev', '版本', 'vendor', '供应商',
+        'tool number', '模号', 'cavity', '穴数', 'date', '日期',
+        'inspected', '确认者', 'material name', '材质名称', '材质牌号',
+        'material code', 'inches', '毫米', 'unit', '单位', 'comments', '签字',
+        'supplier p/n', '供应商料号', 'supplier model', '供应商型号'
+    }
+
+    # === V5.8.7: 表格标题关键词（这些是整个表格的标题，不是数据）===
+    _table_title_keywords = {
+        'sample acknowledgement', '样品承认书', 'catalog', '目录',
+        'bill of material', '物料清单', 'full size measurement', '全尺寸测量',
+        'cpk report', 'cpk 报告', 'packaging method', '包装方式',
+        'process flow', '制造流程图', 'qc flow', 'qc工程图',
+        'rohs', 'reach', 'restricted substances', '限用物质', '调查表',
+        'test report', '测试报告'
+    }
 
     try:
         for t_dict in tables:
@@ -1309,7 +1353,6 @@ def extract_table_headers_part_info(page_analysis, tables=None):
                 if row:
                     row_str = " ".join(str(c) if c else "" for c in row)
                     first_rows_text += row_str + " "
-            # V5.4: 记录当前表格所在页码
             _current_table_page = page_num
 
             first_rows_lower = first_rows_text.lower()
@@ -1328,78 +1371,207 @@ def extract_table_headers_part_info(page_analysis, tables=None):
                 table_type = "制造流程图"
             elif "sample acknowledgement" in first_rows_lower or "样品承认书" in first_rows_text:
                 table_type = "样品承认书"
+            elif "bill of material" in first_rows_lower or "物料清单" in first_rows_text:
+                table_type = "物料清单"
+            elif "packaging method" in first_rows_lower or "包装方式" in first_rows_text:
+                table_type = "包装方式"
 
             # 从表格中提取料号和物料名称
             part_number = ""
             material_name = ""
 
-            for row in table[:5]:  # 只查前5行（通常表头区域）
+            # === V5.8.7: 预扫描：检测哪些行是表头/标题行 ===
+            header_row_indices = set()
+            for ri, row in enumerate(table[:6]):
                 if not row:
                     continue
+                row_text_lower = " ".join(str(c).lower().strip() if c else "" for c in row)
+                # 统计这一行中有多少个表头标签关键词
+                label_count = sum(1 for kw in _header_label_keywords if kw in row_text_lower)
+                # 如果一行有>=3个标签关键词，判定为表头行
+                if label_count >= 3:
+                    header_row_indices.add(ri)
+                # 检查是否是表格标题行（第一行通常是表格标题）
+                if ri == 0:
+                    row_text_clean = " ".join(str(c).strip() if c else "" for c in row)
+                    is_title_row = any(kw in row_text_clean.lower() for kw in _table_title_keywords)
+                    if is_title_row:
+                        header_row_indices.add(ri)
+                    # 第一行如果很短且不含数字，也当作标题
+                    non_empty_cells = [str(c).strip() for c in row if c and str(c).strip()]
+                    if len(non_empty_cells) <= 2 and all(
+                        not re.search(r'\d', cell) for cell in non_empty_cells
+                    ):
+                        header_row_indices.add(ri)
+
+            # === V5.8.7: 在非表头行的数据区域搜索料号和名称 ===
+            for ri, row in enumerate(table):
+                # 跳过已识别的表头/标题行
+                if ri in header_row_indices:
+                    continue
+
+                if not row:
+                    continue
+
+                # 构建当前行的单元格文本列表（用于跨单元格合并检测）
+                cell_texts = []
                 for cell in row:
-                    if cell is None:
+                    cell_texts.append(str(cell).strip() if cell else "")
+
+                # 尝试跨单元格合并检测料号（pdfplumber可能拆分长字符串）
+                for start_ci in range(len(cell_texts)):
+                    if part_number and material_name:
+                        break
+                    if not cell_texts[start_ci]:
                         continue
-                    cell_str = str(cell).strip()
 
-                    # 匹配含料号的单元格
-                    # 常见表头格式：Part Number(料号) | K5311000041LA
-                    # 或：零件件号 | K5311000041LA
-                    # 或跨行：Part material number 零件件号 | K5311000041LA
+                    cell_str = cell_texts[start_ci]
+                    cell_len = len(cell_str)
+
+                    # --- 料号精确匹配 ---
                     pn_cell_patterns = [
-                        r'^[A-Za-z]{1,2}\d{8,}[\w\-]*$',  # 纯料号格式如 K5311000041LA
-                        r'^(K|M|S|NC|XC)[A-Za-z0-9_\-]{6,}$',  # 以常见前缀开头的料号
+                        r'^[A-Za-z]{1,2}\d{8,}[\w\-]*$',       # 纯料号如 K6340000520LA
+                        r'^(K|M|S|NC|XC)[A-Za-z0-9_\-]{6,}$',   # 常见前缀开头的料号
                     ]
-                    for pat in pn_cell_patterns:
-                        if re.match(pat, cell_str):
+                    is_pn_cell = any(re.match(pat, cell_str) for pat in pn_cell_patterns)
+
+                    # 如果当前单元格像部分料号（如 K6340000520），尝试与下一单元格合并
+                    if not is_pn_cell and re.match(r'^(K|M)[0-9]{6,}$', cell_str):
+                        # 检查下一个或几个单元格是否能拼接成完整料号
+                        combined = cell_str
+                        for next_ci in range(start_ci + 1, min(start_ci + 3, len(cell_texts))):
+                            if cell_texts[next_ci]:
+                                combined += cell_texts[next_ci]
+                                if re.match(r'^[A-Za-z]{1,2}\d{8,}[\w\-]*$', combined):
+                                    part_number = combined
+                                    break
+                            else:
+                                break
+                        if not part_number:
+                            # 即使不能形成完整料号，部分匹配也接受
                             part_number = cell_str
-                            break
 
-                    # 匹配含物料名称的单元格
-                    # 常见格式：S1551_WIFI&BT天线_V1.1
-                    name_cell_patterns = [
-                        r'^[A-Za-z0-9_\-\&\+]+(\u5929\u7ebf|\u7ebf\u6750|\u5c4f|LCD|OLED|Display|Scanner|Speaker|Connector|Cable|\u6a21\u5757|\u6a21\u7ec4)[_Vv]?\d*\.?\d*$',
-                        r'^[A-Za-z0-9_\-\&\+_Vv]+\d+\.\d+$',  # 带_Vx.y版本号的名称
-                        r'^S\d+[_\w&\+\-]+$',  # S开头的产品名
-                    ]
-                    for pat in name_cell_patterns:
-                        if re.match(pat, cell_str, re.IGNORECASE):
+                    elif is_pn_cell:
+                        part_number = cell_str
+
+                    # --- 物料名称匹配（V5.8.7严格版）---
+                    if not material_name and cell_str and cell_len >= 5:
+                        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', cell_str))
+                        has_underscore = '_' in cell_str
+
+                        # V5.8.7: 必须满足以下条件才可能是物料名称：
+                        # A) 含中文 且 (长度>=8 或 含下划线) → 如 "屏蔽盖导热硅胶 S0521_Frame..."
+                        # B) 纯英文但含下划线且长度>=15 → 如 "S0521_Frame_heat_RUBBERY"
+                        # C) 排除所有表格类型名、标签文字、短值
+                        is_name_candidate = False
+                        if has_chinese:
+                            # 中文名称：至少5个汉字或混合格式
+                            chinese_char_count = len(re.findall(r'[\u4e00-\u9fff]', cell_str))
+                            if (chinese_char_count >= 3 or cell_len >= 8) and has_underscore:
+                                is_name_candidate = True
+                            elif chinese_char_count >= 5:
+                                is_name_candidate = True
+                        elif has_underscore and cell_len >= 15:
+                            # 长下划线格式英文名
+                            if re.match(r'^S\d+_[\w&]+$', cell_str, re.IGNORECASE):
+                                is_name_candidate = True
+
+                        # 排除明显不是物料名称的值
+                        bad_values = {
+                            'supplier', 'vendor', '小草', '/', 'v1.0', 'v1.1', 'v2.0',
+                            's0521', 'k6340000520la', 'xcdp-p3135', 'xcdp-p3135',
+                        }
+                        cell_lower = cell_str.lower()
+                        is_bad = (
+                            cell_lower in bad_values or
+                            re.match(r'^[A-Z]{1,2}[0-9.]+$', cell_str) or  # 纯型号如V1.0
+                            any(kw in cell_lower for kw in _table_title_keywords) or
+                            any(kw in cell_lower for kw in _header_label_keywords) and not has_chinese
+                        )
+
+                        # 检查同行前一个单元格是否是非名称字段的标签
+                        is_non_name_field = False
+                        if start_ci > 0 and cell_texts[start_ci - 1]:
+                            prev_lower = cell_texts[start_ci - 1].lower().strip()
+                            prev_clean = re.sub(r'[\s/（）():：]', '', prev_lower)
+                            if any(nnl in prev_clean for nnl in _non_name_field_labels):
+                                is_non_name_field = True
+
+                        if is_name_candidate and not is_bad and not is_non_name_field:
                             material_name = cell_str
-                            break
 
-                    # 备用：从键值对格式的单元格中提取
-                    # 如 "Part Number(料号)" 后面紧跟值的行
-                    if re.search(r'(?:part\s*number|料号|零件号|零件件号|material\s*number)', cell_str, re.IGNORECASE):
-                        # 这个单元格是标签，值可能在同行下一个单元格
-                        pass
+                if part_number and material_name:
+                    break
 
-            # 如果上面的精确模式没找到，用更宽松的方式在表头区域搜索
+            # 如果上面的精确模式没找到，用宽松方式搜索（但只在数据行中搜索）
             if not part_number or not material_name:
-                header_text = ""
-                for row in table[:4]:
+                # 只使用非表头行构建搜索文本
+                data_rows_text = ""
+                for ri, row in enumerate(table[:8]):
+                    if ri in header_row_indices:
+                        continue
                     if row:
-                        header_text += " ".join(str(c).strip() if c else "" for c in row) + " "
+                        row_vals = [str(c).strip() if c else "" for c in row]
+                        data_rows_text += " ".join(row_vals) + " "
 
                 # 宽松提取料号（字母+数字组合，长度>=10）
                 if not part_number:
                     loose_pn = re.search(
-                        r'(?:part\s*(?:number|no)|料号|零件号|零件件号|material\s*number)[\s:：()\uff08\uff09\w]*[\s:：]*([A-Za-z][A-Za-z0-9_\-]{7,})',
-                        header_text, re.IGNORECASE
+                        r'(?:part\s*(?:number|no)|料号|零件号|零件件号|material\s*number|零件料号)[\s:：()（）\w]*[\s:：]*([A-Za-z][A-Za-z0-9_\-]{7,})',
+                        data_rows_text, re.IGNORECASE
                     )
                     if loose_pn:
                         part_number = loose_pn.group(1)
 
-                # 宽松提取物料名称（中文或带下划线的英文名）
+                # 宽松提取物料名称（V5.8.7严格版：必须有中文>=3字 或 长下划线英文名）
                 if not material_name:
                     loose_name = re.search(
-                        r'(?:product\s*name|产品名称|description|零件名称|物料名称|part\s*name\s*[/／]\s*model|零件名称[/／]型号)[\s:：()\uff08\uff09\w]*[\s:：]*([A-Za-z0-9_\-&+\u4e00-\u9fff]+)',
-                        header_text, re.IGNORECASE
+                        r'(?:product\s*name|产品名称|description|零件名称|物料名称|part\s*name\s*[/／]\s*model|零件名称[/／]型号|零件名称)[\s:：()（）\w]*[\s:：]*([A-Za-z0-9_\-&+\u4e00-\u9fff]{5,})',
+                        data_rows_text, re.IGNORECASE
                     )
                     if loose_name:
-                        name_candidate = loose_name.group(1).strip()
-                        if len(name_candidate) >= 3:
-                            material_name = name_candidate
+                        candidate = loose_name.group(1).strip()
+                        # V5.8.7 严格过滤
+                        has_cn = bool(re.search(r'[\u4e00-\u9fff]', candidate))
+                        cn_count = len(re.findall(r'[\u4e00-\u9fff]', candidate)) if has_cn else 0
+                        has_long_us = '_' in candidate and len(candidate) >= 15
+                        bad_vals = {'supplier', 'vendor', 'v1.0', 'v1.1', 'v2.0', '/',
+                                    '小草', 's0521', 'k6340000520la', 'xcdp-p3135'}
+                        is_bad = (candidate.lower() in bad_vals or
+                                 re.match(r'^[A-Z]{1,2}[0-9.]+$', candidate) or
+                                 any(kw in candidate.lower() for kw in _table_title_keywords) or
+                                 (not has_cn and not has_long_us))
+                        if (len(candidate) >= 5 and not is_bad and
+                                (cn_count >= 3 or has_long_us)):
+                            material_name = candidate
 
-            if part_number or material_name:
+            # V5.8.7: 只有提取到有效料号或有效名称时才添加结果
+            # 过滤掉明显无效的结果（如表头标题、说明文字等）
+            _is_valid_pn = bool(part_number and re.match(r'^[A-Za-z]{0,2}\d{6,}[\w\-]*$', part_number))
+            # 名称有效性检查：必须不是表头/标题/说明文字
+            _bad_name_prefixes = (
+                'sample acknowledgement', '样品承认书', 'catalog', '目录',
+                'bill of material', '物料清单', 'full size', '全尺寸',
+                'cpk report', 'cpk 报告', 'packaging method', '包装方式',
+                'product specifications', '产品规格书', 'process flow',
+                'rohs', 'reach', 'restricted substances', '受控号',
+                'saleable part', '可销售部件', '表单编码', 'tolerance',
+                'place a layer', '箱子底', '% ', 'remark', '备注',
+                '注意事项', 'material environmental', 'supplier information',
+                'customer review', 'check item'
+            )
+            _is_valid_name = False
+            if material_name:
+                mn_clean = material_name.lower().strip()
+                mn_first_line = material_name.split('\n')[0].strip()[:30].lower()
+                _is_name_bad_prefix = any(p in mn_clean or p in mn_first_line for p in _bad_name_prefixes)
+                # 有效名称：不含坏前缀 且 (含>=3个中文 或 长下划线英文名)
+                cn_count = len(re.findall(r'[\u4e00-\u9fff]', material_name))
+                _is_valid_name = (not _is_name_bad_prefix and
+                                  (cn_count >= 3 or ('_' in material_name and len(material_name) >= 15)) and
+                                  len(material_name) <= 80)
+
+            if (_is_valid_pn or _is_valid_name):
                 table_infos.append({
                     "table_type": table_type,
                     "part_number": part_number,
@@ -1675,9 +1847,14 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4
     table_infos = extract_table_headers_part_info(page_analysis, tables=tables)  # V5.4: 使用预提取表格
     result["table_infos"] = table_infos
 
-    # V5.8.5：过滤掉外部检测报告（SGS/华测等），只对比文档内部表格
-    # 外部报告的料号格式可能与内部不同，不具备可比性
-    _external_report_types = {"RoHS测试报告", "REACH报告", "CPK报告"}
+    # V5.8.5/V5.8.7：过滤掉外部检测报告、调查表和非关键页面，只对比文档内部核心表格
+    # 外部报告/调查表的料号格式可能与内部不同（如Supplier P/N），不具备可比性
+    _external_report_types = {
+        "RoHS测试报告", "RoHS调查表", "REACH报告", "CPK报告",
+        "SGS报告", "华测报告", "材质证明",
+        # V5.8.7: 以下页面类型不参与料号一致性对比
+        "包装方式", "样品照片", "unknown",  # unknown类型通常是非标准格式页面
+    }
     _internal_table_infos = [
         ti for ti in table_infos if ti.get("table_type", "unknown") not in _external_report_types
     ]
@@ -1729,9 +1906,10 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4
 
         # 物料名称比对
         if ref_name and table_name:
-            # 标准化比较（忽略大小写、空格、全角半角差异）
-            name_normalized_ref = ref_name.upper().replace(" ", "").replace("－", "-").replace("_", "_")
-            name_normalized_table = table_name.upper().replace(" ", "").replace("－", "-").replace("_", "_")
+            # V5.8.7: 标准化比较（忽略大小写、空格、换行、全角半角差异）
+            import re as _re
+            name_normalized_ref = _re.sub(r'[\s\n\r\t－_]', '', ref_name.upper())
+            name_normalized_table = _re.sub(r'[\s\n\r\t－_]', '', table_name.upper())
 
             # 允许微小差异（如全尺寸报告多了"线"字）
             if name_normalized_ref == name_normalized_table:
@@ -2201,7 +2379,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.6: 修复CPK值误提取公差/备注数字)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.7: 修复料号一致性5个误报+表头/字段识别)")
 
             progress = st.progress(0)
             detail_results = []
