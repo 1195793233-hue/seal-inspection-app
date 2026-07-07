@@ -1,6 +1,6 @@
 {
-  "version": "5.8.8",
-  "last_updated": "2026-06-29",
+  "version": "5.9.0",
+  "last_updated": "2026-07-07",
   "template_reference": "XC-R-0802-DQM-002物料正式样品承认书模板 Rev D1 20260509",
   "material_types": {
     "electronic": {
@@ -393,6 +393,45 @@
     "description": "第六类：检验结论与处理建议",
     "pass_template": "该封样报告符合XC-R-0802-DQM-002模板要求，建议通过审核。",
     "fail_template": "该封样报告存在以下问题，请供应商补充/修正后重新提交："
+  },
+  "screw_fastener_rules": {
+    "description": "螺丝/紧固件类物料特殊检验规则（V5.9.0新增）",
+    "material_keywords": ["螺丝", "螺钉", "螺栓", "螺母", "screw", "bolt", "nut", "washer", "垫圈", "紧固件"],
+    "drawing_requirements": {
+      "description": "工程图纸技术要求 - 螺丝类物料必须注明",
+      "required_fields": [
+        {
+          "id": "SF-1",
+          "name": "螺丝颜色（Surface Color）",
+          "english": "Screw Color / Surface Treatment Color",
+          "standard": "图纸技术要求或备注中必须明确标注螺丝表面颜色",
+          "examples": ["BLUE-TY-NY", "BLACK-ZN", "WHITE-ZN", "YELLOW-ZN", "NICKEL", "CR+3", "蓝白锌", "白锌", "黄锌", "黑锌", "镍"],
+          "detection_keywords": ["color", "颜色", "coating", "镀层", "surface", "表面处理", "blue", "black", "white", "yellow", "zn", "ni", "cr", "ty", "ny", "蓝", "黑", "白", "黄", "镍", "锌"],
+          "required": true,
+          "note": "常见格式如 BLUE-TY-NY、Color:Blue 等，必须在Remark或技术要求区域体现"
+        },
+        {
+          "id": "SF-2",
+          "name": "耐落处理标注（Nylock/Nylok）",
+          "english": "Nylock / Anti-loose Treatment",
+          "standard": "如有耐落（防松胶/Nylock/Nylok）处理，必须在图纸上明确标注",
+          "keywords_cn": ["耐落", "防松", "尼龙圈", "止退胶", "防松胶", "nylock", "nylok", "nylon patch", "anti-loose", "patch", "嵌件"],
+          "conditional_required": true,
+          "condition_description": "仅当物料实际有耐落处理时需要标注，无此处理则不强制要求",
+          "note": "检测到耐落相关关键词时需确认图中有对应标注；未检测到则跳过此项"
+        },
+        {
+          "id": "SF-3",
+          "name": "点胶处理标注（Gluing/Thread Locker）",
+          "english": "Gluing / Thread Locker Treatment",
+          "standard": "如有点胶（螺纹胶/厌氧胶/Loctite等）处理，必须在图纸上明确标注",
+          "keywords_cn": ["点胶", "螺纹胶", "厌氧胶", "loctite", "乐泰", "glue", "thread locker", "thread adhesive", "密封胶", "预涂胶"],
+          "conditional_required": true,
+          "condition_description": "仅当物料实际有点胶处理时需要标注，无此处理则不强制要求",
+          "note": "检测到点胶相关关键词时需确认图中有对应标注；未检测到则跳过此项"
+        }
+      ]
+    }
   },
   "pdf_analysis_rules": {
     "description": "PDF审核执行方法（V4.0新增）",

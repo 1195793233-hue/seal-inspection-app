@@ -318,6 +318,151 @@ def check_engineering_drawing_detailed(page_analysis):
     return details["has_drawing"], details
 
 
+def check_screw_drawing_requirements(page_analysis, tables=None, material_name=""):
+    """
+    V5.9.0: 螺丝/紧固件类物料工程图纸特殊要求检查
+    检查项：
+      1. 螺丝颜色（必填）- 如 BLUE-TY-NY, 黑锌, 白锌, 镍 等
+      2. 耐落/防松胶处理（条件必填）- 如有则需标注
+      3. 点胶处理（条件必填）- 如有则需标注
+    返回: dict with check results
+    """
+    result = {
+        "is_screw": False,
+        "checks": [],
+        "overall_status": "✅ 通过",
+        "issues": [],
+    }
+
+    # 判断是否为螺丝类物料
+    _screw_keywords = ["螺丝", "螺钉", "螺栓", "screw", "bolt", "fastener", "紧固件"]
+    _name_lower = (material_name + " " + " ".join(p.get("text", "")[:200] for p in page_analysis[:3])).lower()
+    is_screw = any(kw in _name_lower for kw in _screw_keywords)
+
+    if not is_screw:
+        return result
+
+    result["is_screw"] = True
+
+    # 提取图纸页面的文本和表格内容
+    all_text = ""
+    drawing_texts = []
+    for p in page_analysis:
+        if p.get("is_engineering_drawing") or p.get("drawing_number"):
+            drawing_texts.append(p.get("text", ""))
+            all_text += p.get("text", "") + " "
+        # 也检查前10页（有些图纸未被正确标记）
+        elif p.get("page_num", 0) <= 10:
+            all_text += p.get("text", "") + " "
+
+    all_text_lower = all_text.lower()
+
+    # === SF-1: 螺丝颜色（必填）===
+    color_check = {"id": "SF-1", "name": "螺丝颜色(Surface Color)", "status": "", "detail": ""}
+    _color_keywords = [
+        "color", "颜色", "coating", "镀层", "surface", "表面处理",
+        "blue", "black", "white", "yellow", "zn", "ni", "cr",
+        "ty", "ny", "蓝", "黑", "白", "黄", "镍", "锌",
+        "蓝白锌", "白锌", "黄锌", "黑锌", "彩锌"
+    ]
+    _color_patterns = [
+        r'(?:color|颜色|coating|镀层)[\s:\-]*([A-Za-z0-9\-]+)',
+        r'(BLUE|BLACK|WHITE|YELLOW|NI|CR)[\s\-]*(TY|NY|ZN)?',
+        r'(蓝\s*(白|黑)?\s*锌|白\s*锌|黄\s*锌|黑\s*锌|彩\s*锌|镍)',
+        r'([A-Z]{2,}[\-][A-Z]{2,})',  # 如 BLUE-TY-NY
+    ]
+
+    color_found = False
+    color_value = ""
+
+    # 先在表格中查找（更准确）
+    if tables:
+        for t_dict in tables:
+            tbl_page = t_dict.get("page", 0)
+            if tbl_page > 15:
+                continue
+            tbl = t_dict.get("table", [])
+            for row in tbl:
+                if not row:
+                    continue
+                for cell in row:
+                    if cell is None:
+                        continue
+                    cell_str = str(cell).strip()
+                    cell_lower = cell_str.lower()
+                    # 匹配颜色关键词行
+                    if any(kw in cell_lower for kw in ["color", "颜色", "coating", "镀层"]):
+                        # 取同行或附近单元格的值
+                        color_found = True
+                        color_value = cell_str
+                        break
+                    # 直接匹配常见颜色格式
+                    if re.search(r'(BLUE[-\s]*TY[-\s]*NY|BLACK[-\s]*ZN|WHITE[-\s]*ZN|YELLOW[-\s]*ZN|[A-Z]{2,}[-][A-Z]{2,}|蓝.*锌|白.*锌|黄.*锌|黑.*锌)', cell_str, re.IGNORECASE):
+                        color_found = True
+                        color_value = cell_str.strip()
+                        break
+                if color_found:
+                    break
+            if color_found:
+                break
+
+    # 文本兜底搜索
+    if not color_found:
+        for pat in _color_patterns:
+            m = re.search(pat, all_text, re.IGNORECASE)
+            if m:
+                color_found = True
+                color_value = m.group(0).strip()
+                break
+
+    if color_found:
+        color_check["status"] = "✅ 已注明"
+        color_check["detail"] = f"检测到颜色信息：{color_value[:50]}"
+    else:
+        color_check["status"] = "❌ 缺失"
+        color_check["detail"] = "工程图纸未注明螺丝颜色（Surface Color / Coating）"
+        result["issues"].append("[SF-1] 工程图纸缺少螺丝颜色标注")
+
+    result["checks"].append(color_check)
+
+    # === SF-2: 耐落处理（条件必填）===
+    nylock_check = {"id": "SF-2", "name": "耐落处理(Nylock)", "status": "", "detail": ""}
+    _nylock_keywords = ["耐落", "防松", "尼龙圈", "止退胶", "防松胶", "nylock", "nylok", "nylon patch", "anti-loose"]
+    has_nylock_ref = any(kw in all_text_lower for kw in _nylock_keywords)
+
+    if has_nylock_ref:
+        # 有耐落相关引用，需确认图纸上明确标注
+        nylock_check["status"] = "✅ 已注明"
+        nylock_check["detail"] = f"检测到耐落处理标注"
+    else:
+        nylock_check["status"] = "⏭️ 不适用"
+        nylock_check["detail"] = "未检测到耐落处理需求，跳过此项"
+
+    result["checks"].append(nylock_check)
+
+    # === SF-3: 点胶处理（条件必填）===
+    glue_check = {"id": "SF-3", "name": "点胶处理(Gluing)", "status": "", "detail": ""}
+    _glue_keywords = ["点胶", "螺纹胶", "厌氧胶", "loctite", "乐泰", "thread locker", "密封胶", "预涂胶"]
+    has_glue_ref = any(kw in all_text_lower for kw in _glue_keywords)
+
+    if has_glue_ref:
+        glue_check["status"] = "✅ 已注明"
+        glue_check["detail"] = f"检测到点胶处理标注"
+    else:
+        glue_check["status"] = "⏭️ 不适用"
+        glue_check["detail"] = "未检测到点胶处理需求，跳过此项"
+
+    result["checks"].append(glue_check)
+
+    # 整体状态判定
+    if color_check["status"] == "❌ 缺失":
+        result["overall_status"] = "❌ 不合格（螺丝颜色缺失）"
+    else:
+        result["overall_status"] = "✅ 通过"
+
+    return result
+
+
 def check_product_specification(page_analysis):
     """
     V4.0 步骤4：产品规格书判定
@@ -1989,6 +2134,11 @@ def generate_final_verdict_v62(material_type, all_results, standards):
     if part_consistency.get("issues"):
         issues.extend(part_consistency["issues"])
 
+    # V5.9.0: 螺丝类物料图纸特殊要求问题
+    screw_check = all_results.get("screw_check", {})
+    if screw_check.get("is_screw") and screw_check.get("issues"):
+        issues.extend(screw_check["issues"])
+
     total_fail = completeness.get("fail_count", 0)
     critical_fail = (
         completeness["status"] == "❌ 不合格"
@@ -1999,6 +2149,7 @@ def generate_final_verdict_v62(material_type, all_results, standards):
         or validity["overall_status"] == "❌ 不合格"
         or catalog_check.get("status", "").startswith("❌")
         or part_consistency.get("overall_status", "").startswith("❌")
+        or (screw_check.get("is_screw") and screw_check.get("overall_status", "").startswith("❌"))  # V5.9.0
     )
 
     if critical_fail or len(issues) > 3:
@@ -2091,6 +2242,10 @@ def run_full_inspection(file_path, file_name, standards):
     catalog_check = check_catalog_checkboxes(file_path, page_analysis, tables=tables)  # V5.5: 传入预提取表格
     part_consistency = check_part_number_consistency(page_analysis, file_path, tables=tables)  # V5.4: 传入预提取表格
 
+    # V5.9.0 新增：螺丝/紧固件类物料工程图纸特殊要求检查
+    _cover_name = part_consistency.get("cover_info", {}).get("material_name", "")
+    screw_check = check_screw_drawing_requirements(page_analysis, tables=tables, material_name=_cover_name)
+
     # V5.7 新增：根据料号识别物料类型（基于物料编码规则）
     _coding_rules = load_material_coding_rules()
     _mat_type_detail = mat_type_cn  # 默认使用原来的识别结果
@@ -2118,6 +2273,7 @@ def run_full_inspection(file_path, file_name, standards):
         "validity": validity,
         "catalog_check": catalog_check,
         "part_consistency": part_consistency,
+        "screw_check": screw_check,  # V5.9.0
     }
     final = generate_final_verdict_v62(mat_type, all_results, standards)
 
@@ -2141,6 +2297,8 @@ def run_full_inspection(file_path, file_name, standards):
         # V6.2 新增
         "目录勾选状态": catalog_check.get("status", "⏱ 未检测"),
         "料号一致性": part_consistency.get("overall_status", "⏱ 未检测"),
+        # V5.9.0 新增：螺丝类物料图纸特殊要求
+        "螺丝图纸要求": screw_check.get("overall_status", "⏭️ 不适用") if screw_check.get("is_screw") else "⏭️ 不适用",
         # 原有
         "总体结论": final["verdict"],
         "问题数量": final["issue_count"],
@@ -2172,6 +2330,7 @@ def run_full_inspection(file_path, file_name, standards):
             # V6.2 新增
             "catalog_check": catalog_check,
             "part_consistency": part_consistency,
+            "screw_check": screw_check,  # V5.9.0
             #
             "final": final,
         },
@@ -2380,7 +2539,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.8.7: 修复料号一致性5个误报+表头/字段识别)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.9.0: 新增螺丝类物料图纸特殊要求-颜色/耐落/点胶)")
 
             progress = st.progress(0)
             detail_results = []
@@ -2436,11 +2595,13 @@ with col2:
                             "validity": {"sub_items": {}, "overall_status": "⏱ 异常", "issues": []},
                             "catalog_check": None,
                             "part_consistency": None,
+                            "screw_check": None,  # V5.9.0
                         },
                         **{k: "⏱ 异常" for k in [
                             "文件类型","物料类型","需要电气性能测试",
                             "文件完整性","RoHS合规性","CPK合规性",
                             "尺寸对应性","报告时效性","目录勾选状态","料号一致性",
+                            "螺丝图纸要求",  # V5.9.0
                             "审核时间","标准版本"
                         ]}
                     })
@@ -2642,6 +2803,7 @@ with col2:
                         ("报告时效性", dd.get("validity")),
                         ("目录勾选", dd.get("catalog_check")),
                         ("料号一致性", dd.get("part_consistency")),
+                        ("螺丝图纸要求", dd.get("screw_check")),  # V5.9.0
                     ]
                     
                     for check_name, check_data in checks:
