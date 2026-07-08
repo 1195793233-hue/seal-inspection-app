@@ -2081,6 +2081,52 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4
 
         result["consistency_checks"].append(check_result)
 
+    # Step 4: V5.9.1 新增 —— 文件名料号 vs 文档内容料号一致性检查
+    # 用户场景：文件命名为 CRS_K5350000042LA_...pdf，但文档内料号为 K5311000042LA，
+    # 这类"文不对题"的命名错误需在料号一致性检查中暴露出来
+    _fname = os.path.basename(pdf_path)
+    _fn_pn_match = re.search(r'(K\d{6,}[A-Za-z]*)', _fname, re.IGNORECASE)
+    _fn_pn = None
+    if _fn_pn_match:
+        _fn_pn = _fn_pn_match.group(1).upper().replace(" ", "").replace("-", "")
+    result["filename_part_number"] = _fn_pn  # 供UI/Excel展示
+
+    if _fn_pn:
+        # 4.1 与封面料号比对
+        if ref_pn:
+            _ref_pn_norm = ref_pn.upper().replace(" ", "").replace("-", "")
+            if _fn_pn != _ref_pn_norm:
+                result["issues"].append(
+                    f"[文件名 vs 封面] 料号不一致：文件名'{_fn_pn}' ≠ 封面料号'{ref_pn}'"
+                )
+                result["consistency_checks"].append({
+                    "table_type": "文件名 vs 封面",
+                    "page_num": 0,
+                    "pn_match": "❌ 不一致",
+                    "name_match": None,
+                    "pn_detail": f"文件名:{_fn_pn} ≠ 封面:{ref_pn}",
+                    "name_detail": "",
+                })
+
+        # 4.2 与内部各表格料号比对（封面提取失败时可在此发现差异）
+        for ti in _internal_table_infos:
+            _tp = ti.get("part_number")
+            if _tp:
+                _tp_norm = _tp.upper().replace(" ", "").replace("-", "")
+                if _fn_pn != _tp_norm:
+                    result["issues"].append(
+                        f"[文件名 vs {ti.get('table_type', '未知')}(第{ti.get('page_num', 0)}页)] "
+                        f"料号不一致：文件名'{_fn_pn}' ≠ 表头'{_tp}'"
+                    )
+                    result["consistency_checks"].append({
+                        "table_type": f"文件名 vs {ti.get('table_type', '未知')}",
+                        "page_num": ti.get("page_num", 0),
+                        "pn_match": "❌ 不一致",
+                        "name_match": None,
+                        "pn_detail": f"文件名:{_fn_pn} ≠ 表头:{_tp}",
+                        "name_detail": "",
+                    })
+
     # V5.8.3 修复：判定整体状态
     # 料号一致性检查的核心是**料号(Part Number)**的一致性，物料名称仅作参考
     # 只有料号不一致才判定为❌不合格；物料名称不一致仅记录为⚠️警告
@@ -2539,7 +2585,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.9.0: 新增螺丝类物料图纸特殊要求-颜色/耐落/点胶)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.9.1: 新增文件名料号vs内容料号一致性检查)")
 
             progress = st.progress(0)
             detail_results = []
