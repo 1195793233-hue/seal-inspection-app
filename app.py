@@ -568,6 +568,29 @@ def check_supplier_info_completeness(page_analysis, tables=None):
                 return True
         return False
 
+    def _looks_like_label(val_str):
+        """判断单元格内容是否像另一个字段标签（而非具体值），用于避免跨字段误取"""
+        v = val_str.strip().lower()
+        if not v:
+            return False
+        _label_markers = [
+            "supplier", "供应商", "address", "地址", "contact", "联系方式",
+            "email", "邮箱", "recipient", "收件人", "recognition", "承认",
+            "sign", "签署", "date", "日期",
+            "department", "部门", "producer", "制作人", "engineering", "工程",
+            "design", "设计", "quality", "品管", "name", "名称",
+            "note", "注意", "review", "审核", "customer", "客户",
+        ]
+        # 如果值本身较短且含标签标记词，判定为标签
+        if len(v) <= 30 and any(mk in v for mk in _label_markers):
+            return True
+        # 若整行以"供应商/地址/邮箱/联系/Supplier/Recipient"等标签词开头，也视为标签
+        if any(v.startswith(mk) for mk in ["supplier", "供应商", "address", "地址",
+                                            "contact", "联系方式", "email", "邮箱",
+                                            "recipient", "收件人", "note", "注意"]):
+            return True
+        return False
+
     def _find_field_value(field_keywords, search_area=None):
         """
         在搜索区域中查找目标字段对应的值
@@ -577,6 +600,8 @@ def check_supplier_info_completeness(page_analysis, tables=None):
         area = search_area or combined_text
         
         # 方法1: 表格查找（最准确）
+        # 注意：复杂表单中"Supplier name"单元格右侧可能紧邻"Recognition state"等其他字段，
+        #       因此只取标签【正下方同列】的单元格作为值，且排除"看起来像另一个标签"的内容
         for tbl in cover_tables:
             for row_idx, row in enumerate(tbl):
                 if not row:
@@ -587,36 +612,41 @@ def check_supplier_info_completeness(page_analysis, tables=None):
                     cell_str = str(cell).strip()
                     cell_lower = cell_str.lower()
                     
-                    # 找到字段标签行/单元格
+                    # 找到字段标签单元格
                     if any(kw in cell_lower for kw in field_keywords):
-                        # 取同行右侧相邻单元格的值
-                        for j in range(col_idx + 1, len(row)):
-                            if row[j] is not None:
-                                val = str(row[j]).strip()
-                                if val and not _is_placeholder(val):
-                                    return True, val, f"表格(row{row_idx},col{j})"
-                        
-                        # 取下一行同列的值（字段在上一行，值在下一行）
+                        # 取正下方同列的单元格（值通常在标签下方）
                         if row_idx + 1 < len(tbl):
                             next_row = tbl[row_idx + 1]
                             if next_row and col_idx < len(next_row) and next_row[col_idx] is not None:
                                 val = str(next_row[col_idx]).strip()
-                                if val and not _is_placeholder(val):
+                                if val and not _is_placeholder(val) and not _looks_like_label(val):
                                     return True, val, f"表格(row{row_idx+1},col{col_idx})"
+                        
+                        # 备选：取同行右侧紧邻单元格（仅当它不是另一个标签）
+                        if col_idx + 1 < len(row) and row[col_idx + 1] is not None:
+                            val = str(row[col_idx + 1]).strip()
+                            if val and not _is_placeholder(val) and not _looks_like_label(val):
+                                return True, val, f"表格(row{row_idx},col{col_idx+1})"
         
-        # 方法2: 文本正则查找（兜底）
-        for kw in field_keywords:
-            patterns = [
-                rf'{kw}[\s:\-：]*([^\n\r]+)',
-                rf'({kw}[^a-zA-Z\u4e00-\u9fff]*)[\s:\-：]*([^\n\r]+)',
-            ]
-            for pat in patterns:
-                m = re.search(pat, area, re.IGNORECASE)
-                if m:
-                    # 取最后一个捕获组
-                    val = (m.group(len(m.groups()))).strip()
-                    if val and not _is_placeholder(val):
-                        return True, val, "文本正则"
+        # 方法2: 文本按行查找（兜底，更准确处理"标签：值"同行格式）
+        lines = area.split("\n")
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            if any(kw in line_stripped.lower() for kw in field_keywords):
+                # 取同行冒号后的内容
+                m = re.search(r'[:：]\s*(.*)$', line_stripped)
+                val = m.group(1).strip() if m else ""
+                if val and not _is_placeholder(val) and not _looks_like_label(val):
+                    return True, val, "文本同行"
+                # 同行无值：检查下一行（仅当下一行不是另一个字段标签）
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+                    if nxt and not _is_placeholder(nxt) and not _looks_like_label(nxt):
+                        return True, nxt, "文本下一行"
+        
+        return False, "", ""
         
         return False, "", ""
 
