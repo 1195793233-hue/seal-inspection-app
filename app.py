@@ -463,6 +463,277 @@ def check_screw_drawing_requirements(page_analysis, tables=None, material_name="
     return result
 
 
+def check_supplier_info_completeness(page_analysis, tables=None):
+    """
+    V5.9.2: 封面供应商信息完整性检查
+    检查封样承认书封面页的 "Supplier Information（供应商信息）" 区域是否完整填写。
+    
+    必填字段：
+      SI-1 供应商名称（Supplier name）— 必须填写，不能为空或占位符
+      SI-2 供应商地址（Supplier address）— 必须填写
+      SI-3 联系方式（Supplier contact）— 必须填写真实信息，不能仅为占位符(XXX)
+      SI-4 收件人邮箱（Recipient email）— 必须填写
+    
+    参考字段（不影响合格判定，仅作提示）：
+      SI-5 部门签署（Department Signatures）— Produced/Engineering/Design/Quality + 签名+日期
+    
+    返回: dict {
+        "checks": [...],
+        "overall_status": "✅ 通过" | "❌ 不合格",
+        "issues": [...],
+        "supplier_name_found": str or None,
+        "cover_page_num": int,
+    }
+    """
+    result = {
+        "checks": [],
+        "overall_status": "✅ 通过",
+        "issues": [],
+        "supplier_name_found": None,
+        "cover_page_num": 0,
+    }
+
+    # --- 定位封面页 ---
+    cover_page = None
+    cover_text = ""
+    for p in page_analysis:
+        if p.get("is_cover"):
+            cover_page = p
+            result["cover_page_num"] = p.get("page_num", 0)
+            break
+
+    # 如果未标记is_cover，取前3页作为备选
+    if not cover_page:
+        for p in page_analysis[:3]:
+            txt = p.get("text", "")
+            if any(kw in txt.lower() for kw in ["provisional sample", "临时样品承认书", "sample acknowledgement"]):
+                cover_page = p
+                result["cover_page_num"] = p.get("page_num", 0)
+                break
+
+    # 最终兜底：取第1页
+    if not cover_page and page_analysis:
+        cover_page = page_analysis[0]
+        result["cover_page_num"] = cover_page.get("page_num", 1)
+
+    if not cover_page:
+        result["overall_status"] = "⏱ 无法检测"
+        result["issues"].append("[SI] 无法定位封面页")
+        return result
+
+    cover_text = cover_page.get("text", "")
+    cover_text_lower = cover_text.lower()
+
+    # === 收集封面表格数据（更准确）===
+    cover_tables = []
+    if tables:
+        cpn = result["cover_page_num"]
+        for t_dict in tables:
+            tpg = t_dict.get("page", 0)
+            # 封面表格通常在page 1~5
+            if tpg <= 5:
+                tbl = t_dict.get("table", [])
+                if tbl:
+                    cover_tables.append(tbl)
+
+    # 将所有表格单元格文本合并用于搜索
+    all_table_text = ""
+    for tbl in cover_tables:
+        for row in tbl:
+            if row:
+                for cell in row:
+                    if cell:
+                        all_table_text += str(cell) + "\n"
+
+    combined_text = cover_text + "\n" + all_table_text
+
+    # 占位符/无效内容模式
+    _placeholder_patterns = [
+        r'^xxx[\-\s]*$',           # 纯XXX
+        r'^xxx.*$',                 # 以XXX开头
+        r'不能填写序列号',          # 提示性文字
+        r'placeholder',             # placeholder英文
+        r'^\s*[-_]+\s*$',           # 纯横线/下划线
+        r'^[Nn][Aa]\s*$',          # N/A
+        r'^\s*$',                   # 空白
+    ]
+
+    def _is_placeholder(val_str):
+        """判断值是否为占位符或无效"""
+        v = val_str.strip()
+        if not v or len(v) < 2:
+            return True
+        for pat in _placeholder_patterns:
+            if re.match(pat, v, re.IGNORECASE):
+                return True
+        return False
+
+    def _find_field_value(field_keywords, search_area=None):
+        """
+        在搜索区域中查找目标字段对应的值
+        field_keywords: 字段标签关键词列表，如 ["Supplier name", "供应商名称"]
+        返回: (found: bool, value: str, source: str)
+        """
+        area = search_area or combined_text
+        
+        # 方法1: 表格查找（最准确）
+        for tbl in cover_tables:
+            for row_idx, row in enumerate(tbl):
+                if not row:
+                    continue
+                for col_idx, cell in enumerate(row):
+                    if cell is None:
+                        continue
+                    cell_str = str(cell).strip()
+                    cell_lower = cell_str.lower()
+                    
+                    # 找到字段标签行/单元格
+                    if any(kw in cell_lower for kw in field_keywords):
+                        # 取同行右侧相邻单元格的值
+                        for j in range(col_idx + 1, len(row)):
+                            if row[j] is not None:
+                                val = str(row[j]).strip()
+                                if val and not _is_placeholder(val):
+                                    return True, val, f"表格(row{row_idx},col{j})"
+                        
+                        # 取下一行同列的值（字段在上一行，值在下一行）
+                        if row_idx + 1 < len(tbl):
+                            next_row = tbl[row_idx + 1]
+                            if next_row and col_idx < len(next_row) and next_row[col_idx] is not None:
+                                val = str(next_row[col_idx]).strip()
+                                if val and not _is_placeholder(val):
+                                    return True, val, f"表格(row{row_idx+1},col{col_idx})"
+        
+        # 方法2: 文本正则查找（兜底）
+        for kw in field_keywords:
+            patterns = [
+                rf'{kw}[\s:\-：]*([^\n\r]+)',
+                rf'({kw}[^a-zA-Z\u4e00-\u9fff]*)[\s:\-：]*([^\n\r]+)',
+            ]
+            for pat in patterns:
+                m = re.search(pat, area, re.IGNORECASE)
+                if m:
+                    # 取最后一个捕获组
+                    val = (m.group(len(m.groups()))).strip()
+                    if val and not _is_placeholder(val):
+                        return True, val, "文本正则"
+        
+        return False, "", ""
+
+    # === SI-1: 供应商名称（必填）===
+    si1 = {"id": "SI-1", "name": "供应商名称(Supplier name)", "status": "", "detail": ""}
+    found, val, src = _find_field_value(["supplier name", "供应商名称", "供应商名称名称"])
+    if found and val:
+        si1["status"] = "✅ 已填写"
+        si1["detail"] = f"{val[:60]}"
+        result["supplier_name_found"] = val[:60]
+    else:
+        si1["status"] = "❌ 未填写"
+        si1["detail"] = "封面「供应商信息」区域缺少供应商名称"
+        result["issues"].append("[SI-1] 供应商名称未填写（Supplier name）")
+    result["checks"].append(si1)
+
+    # === SI-2: 供应商地址（必填）===
+    si2 = {"id": "SI-2", "name": "供应商地址(Supplier address)", "status": "", "detail": ""}
+    found, val, src = _find_field_value(["supplier address", "供应商地址", "供应商品质地址"])
+    if found and val:
+        si2["status"] = "✅ 已填写"
+        si2["detail"] = f"{val[:60]}"
+    else:
+        si2["status"] = "❌ 未填写"
+        si2["detail"] = "封面缺少供应商地址信息"
+        result["issues"].append("[SI-2] 供应商地址未填写（Supplier address）")
+    result["checks"].append(si2)
+
+    # === SI-3: 联系方式/联系人电话（必填，排除占位符）===
+    si3 = {"id": "SI-3", "name": "联系方式(Supplier contact)", "status": "", "detail": ""}
+    found, val, src = _find_field_value(["supplier contact", "联系方式", "联系人电话", "供应商联系人"])
+    if found and val:
+        # 额外检查是否为占位符（如纯XXX、手机号占位符等）
+        if _is_placeholder(val):
+            si3["status"] = "❌ 无效（占位符）"
+            si3["detail"] = f"联系方式仅含占位符文字（{val[:30]}），需填写真实联系信息"
+            result["issues"].append(f"[SI-3] 联系方式为占位符（{val[:30]}），请填写真实联系方式")
+        else:
+            si3["status"] = "✅ 已填写"
+            si3["detail"] = f"{val[:60]}"
+    else:
+        si3["status"] = "❌ 未填写"
+        si3["detail"] = "封面缺少供应商联系方式"
+        result["issues"].append("[SI-3] 联系方式未填写（Supplier contact）")
+    result["checks"].append(si3)
+
+    # === SI-4: 收件人邮箱地址（必填）===
+    si4 = {"id": "SI-4", "name": "收件人邮箱(Email)", "status": "", "detail": ""}
+    found, val, src = _find_field_value(["recipient email", "收件人邮箱", "email address"])
+    if found and val:
+        # 检查是否像有效email（包含@符号和域名）
+        if "@" in val:
+            si4["status"] = "✅ 已填写"
+            si4["detail"] = f"{val[:50]}"
+        elif _is_placeholder(val):
+            si4["status"] = "❌ 无效（占位符）"
+            si4["detail"] = f"邮箱仅含占位符（{val[:30]}）"
+            result["issues"].append(f"[SI-4] 收件人邮箱为占位符（{val[:30]}）")
+        else:
+            si4["status"] = "✅ 已填写"
+            si4["detail"] = f"{val[:50]}"
+    else:
+        si4["status"] = "❌ 未填写"
+        si4["detail"] = "封面缺少收件人邮箱地址"
+        result["issues"].append("[SI-4] 收件人邮箱未填写（Email）")
+    result["checks"].append(si4)
+
+    # === SI-5: 部门签署（参考项，不判定不合格）===
+    si5 = {"id": "SI-5", "name": "部门签署(Department Signatures)", "status": "", "detail": ""}
+    sig_keywords = ["produced", "engineering department", "design department", "quality department",
+                     "制作人", "工程部", "设计部", "品管部", "签署者", "signatory"]
+    date_keywords = ["signing date", "签署日期", "签名日期"]
+    
+    # 检查是否有签名（手写体通常提取不出，但如果有盖章或打印体名字则可识别）
+    sig_found = any(kw in cover_text_lower for kw in sig_keywords)
+    date_found = any(kw in cover_text_lower for kw in date_keywords)
+    
+    # 在表格中查找签名区域是否有实际内容（非空格）
+    sig_content_found = False
+    for tbl in cover_tables:
+        for row in tbl:
+            for cell in row:
+                if cell:
+                    cs = str(cell).strip()
+                    # 签名区域可能有日期格式如 2026.6.8 或中文姓名
+                    if re.search(r'\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}', cs) or \
+                       (len(cs) >= 2 and len(cs) <= 10 and re.search(r'[\u4e00-\u9fff]{2,}', cs)):
+                        sig_content_found = True
+                        break
+            if sig_content_found:
+                break
+        if sig_content_found:
+            break
+
+    if sig_content_found:
+        si5["status"] = "✅ 已签署"
+        si5["detail"] = "检测到签名/日期信息"
+    elif sig_found and date_found:
+        si5["status"] = "⚠️ 有签署区但内容疑似空白"
+        si5["detail"] = "存在部门签署区域，建议确认各栏已签字并注明日期"
+    else:
+        si5["status"] = "⚠️ 未检测到签署信息"
+        si5["detail"] = "未检测到部门签署信息（此项为参考项）"
+    result["checks"].append(si5)
+
+    # === 整体状态判定 ===
+    required_fails = sum(1 for c in result["checks"][:4] if c["status"].startswith("❌"))
+    if required_fails >= 3:
+        result["overall_status"] = "❌ 不合格（供应商信息严重缺失）"
+    elif required_fails >= 1:
+        result["overall_status"] = "❌ 不合格（供应商信息不完整）"
+    else:
+        result["overall_status"] = "✅ 通过"
+
+    return result
+
+
 def check_product_specification(page_analysis):
     """
     V4.0 步骤4：产品规格书判定
@@ -2185,6 +2456,11 @@ def generate_final_verdict_v62(material_type, all_results, standards):
     if screw_check.get("is_screw") and screw_check.get("issues"):
         issues.extend(screw_check["issues"])
 
+    # V5.9.2: 封面供应商信息完整性问题
+    supplier_check = all_results.get("supplier_check", {})
+    if supplier_check.get("issues"):
+        issues.extend(supplier_check["issues"])
+
     total_fail = completeness.get("fail_count", 0)
     critical_fail = (
         completeness["status"] == "❌ 不合格"
@@ -2196,6 +2472,7 @@ def generate_final_verdict_v62(material_type, all_results, standards):
         or catalog_check.get("status", "").startswith("❌")
         or part_consistency.get("overall_status", "").startswith("❌")
         or (screw_check.get("is_screw") and screw_check.get("overall_status", "").startswith("❌"))  # V5.9.0
+        or supplier_check.get("overall_status", "").startswith("❌")  # V5.9.2
     )
 
     if critical_fail or len(issues) > 3:
@@ -2292,6 +2569,9 @@ def run_full_inspection(file_path, file_name, standards):
     _cover_name = part_consistency.get("cover_info", {}).get("material_name", "")
     screw_check = check_screw_drawing_requirements(page_analysis, tables=tables, material_name=_cover_name)
 
+    # V5.9.2 新增：封面供应商信息完整性检查
+    supplier_check = check_supplier_info_completeness(page_analysis, tables=tables)
+
     # V5.7 新增：根据料号识别物料类型（基于物料编码规则）
     _coding_rules = load_material_coding_rules()
     _mat_type_detail = mat_type_cn  # 默认使用原来的识别结果
@@ -2320,6 +2600,7 @@ def run_full_inspection(file_path, file_name, standards):
         "catalog_check": catalog_check,
         "part_consistency": part_consistency,
         "screw_check": screw_check,  # V5.9.0
+        "supplier_check": supplier_check,  # V5.9.2
     }
     final = generate_final_verdict_v62(mat_type, all_results, standards)
 
@@ -2345,6 +2626,8 @@ def run_full_inspection(file_path, file_name, standards):
         "料号一致性": part_consistency.get("overall_status", "⏱ 未检测"),
         # V5.9.0 新增：螺丝类物料图纸特殊要求
         "螺丝图纸要求": screw_check.get("overall_status", "⏭️ 不适用") if screw_check.get("is_screw") else "⏭️ 不适用",
+        # V5.9.2 新增：封面供应商信息完整性
+        "供应商信息": supplier_check.get("overall_status", "⏱ 未检测"),
         # 原有
         "总体结论": final["verdict"],
         "问题数量": final["issue_count"],
@@ -2377,6 +2660,7 @@ def run_full_inspection(file_path, file_name, standards):
             "catalog_check": catalog_check,
             "part_consistency": part_consistency,
             "screw_check": screw_check,  # V5.9.0
+            "supplier_check": supplier_check,  # V5.9.2
             #
             "final": final,
         },
@@ -2585,7 +2869,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.9.1: 新增文件名料号vs内容料号一致性检查)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.9.2: 新增封面供应商信息完整性检查)")
 
             progress = st.progress(0)
             detail_results = []
@@ -2642,12 +2926,14 @@ with col2:
                             "catalog_check": None,
                             "part_consistency": None,
                             "screw_check": None,  # V5.9.0
+                            "supplier_check": None,  # V5.9.2
                         },
                         **{k: "⏱ 异常" for k in [
                             "文件类型","物料类型","需要电气性能测试",
                             "文件完整性","RoHS合规性","CPK合规性",
                             "尺寸对应性","报告时效性","目录勾选状态","料号一致性",
                             "螺丝图纸要求",  # V5.9.0
+                            "供应商信息",  # V5.9.2
                             "审核时间","标准版本"
                         ]}
                     })
@@ -2806,6 +3092,27 @@ with col2:
                             pc_df = pd.DataFrame(pc_rows)
                             st.dataframe(pc_df, use_container_width=True, hide_index=True)
 
+                    # V5.9.2 新增：封面供应商信息完整性
+                    if d.get("supplier_check"):
+                        sc = d["supplier_check"]
+                        if isinstance(sc, dict):
+                            st.subheader("7️⃣b 封面供应商信息完整性（V5.9.2）")
+                            st.markdown(f"**整体判定:** {sc.get('overall_status', 'N/A')}")
+                            if sc.get("supplier_name_found"):
+                                st.markdown(f"**检测到供应商:** `{sc['supplier_name_found']}`")
+                            # 逐项显示检查结果
+                            sc_checks = sc.get("checks", [])
+                            if sc_checks:
+                                sc_rows = []
+                                for c in sc_checks:
+                                    sc_rows.append({
+                                        "检查项": c.get("name", ""),
+                                        "状态": c.get("status", ""),
+                                        "详情": c.get("detail", "")[:80],
+                                    })
+                                sc_df = pd.DataFrame(sc_rows)
+                                st.dataframe(sc_df, use_container_width=True, hide_index=True)
+
                     # 最终处理建议
                     st.subheader("8️⃣ 检验结论与处理建议")
                     st.markdown(f"**{d['final']['verdict']}**")
@@ -2850,6 +3157,7 @@ with col2:
                         ("目录勾选", dd.get("catalog_check")),
                         ("料号一致性", dd.get("part_consistency")),
                         ("螺丝图纸要求", dd.get("screw_check")),  # V5.9.0
+                        ("供应商信息", dd.get("supplier_check")),  # V5.9.2
                     ]
                     
                     for check_name, check_data in checks:
