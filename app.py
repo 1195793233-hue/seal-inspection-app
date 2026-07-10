@@ -524,14 +524,33 @@ def check_supplier_info_completeness(page_analysis, tables=None):
     cover_text = cover_page.get("text", "")
     cover_text_lower = cover_text.lower()
 
+    # V5.9.3: 如果封面页文本为空或极短（图片型封面/空白页），跳过检查
+    # 同时检查是否真正包含"Supplier information"区域（排除BOM表头误匹配）
+    _has_supplier_section = any(kw in cover_text_lower for kw in [
+        "supplier information", "供应商信息",
+    ])
+    _has_cover_keyword = any(kw in cover_text_lower for kw in [
+        "provisional sample", "临时样品承认书", "sample acknowledgement",
+        "样品承认书",
+    ])
+    if not cover_text.strip() or (len(cover_text.strip()) < 20 and not _has_supplier_section):
+        result["overall_status"] = "⏱ 无法检测"
+        result["issues"].append("[SI] 封面页无可提取文本（可能为图片型封面），跳过供应商信息检查")
+        return result
+    # 如果页面有文本但没有"Supplier information"区域标记，也跳过（避免BOM表头误匹配）
+    if not _has_supplier_section and not _has_cover_keyword:
+        result["overall_status"] = "⏱ 不适用"
+        result["issues"].append("[SI] 封面页未包含\"Supplier information 供应商信息\"区域，跳过检查")
+        return result
+
     # === 收集封面表格数据（更准确）===
+    # V5.9.3: 只取封面页的表格，避免误扫描BOM表头
     cover_tables = []
     if tables:
         cpn = result["cover_page_num"]
         for t_dict in tables:
             tpg = t_dict.get("page", 0)
-            # 封面表格通常在page 1~5
-            if tpg <= 5:
+            if tpg == cpn:  # 只取封面页表格
                 tbl = t_dict.get("table", [])
                 if tbl:
                     cover_tables.append(tbl)
@@ -1496,16 +1515,48 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
     """
     result = {"part_number": "", "material_name": "", "page_num": 0}
 
+    # V5.9.3: 辅助函数：判断字符串是否像表格表头行（含多个列标签）
+    def _looks_like_header_row(val):
+        if not val or len(val.strip()) < 5:
+            return False
+        v_lower = val.lower()
+        header_keywords = [
+            "supplier", "供应商", "model", "型号", "number", "数量",
+            "remark", "备注", "description", "描述", "name", "名称",
+            "date", "日期", "part", "零件", "material", "物料", "rosh", "rohs",
+            "yes", "no", "是", "否", "item", "序号"
+        ]
+        kw_count = sum(1 for kw in header_keywords if kw in v_lower)
+        return kw_count >= 4  # 含4个及以上列标签关键词即视为表头行
+
     # 寻找封面页或样品承认书页
     cover_pages = [p for p in page_analysis if p.get("is_cover")]
     if not cover_pages:
-        # 尝试从含物料信息的页面提取
+        # V5.9.3: 先尝试严格封面关键词（避免把BOM页误判为封面）
         cover_pages = [p for p in page_analysis if any(
             kw in p.get("text", "") for kw in [
-                "material number", "物料编号", "product name", "产品名称",
-                "sample acknowledgement", "样品承认书", "part number", "料号"
+                "sample acknowledgement", "样品承认书",
+                "Supplier information", "供应商信息",
+                "Customer review", "客户审核",
             ]
         )]
+
+    if not cover_pages:
+        # V5.9.3: 再尝试含物料信息的页面，但排除明显的BOM/目录页
+        _bom_catalog_keywords = ["bill of material", "物料清单", "catalog", "目录",
+                                  "item number", "supplier model", "供应商型号"]
+        for p in page_analysis[:5]:
+            txt = p.get("text", "")
+            if not txt:
+                continue
+            has_material_kw = any(kw in txt for kw in [
+                "material number", "物料编号", "product name", "产品名称",
+                "part number", "料号"
+            ])
+            is_bom_catalog = any(kw in txt.lower() for kw in _bom_catalog_keywords)
+            if has_material_kw and not is_bom_catalog:
+                cover_pages.append(p)
+                break
 
     # V5.8.5 新增：优先从封面表格中提取（表格格式封面比文本提取更准确）
     _cover_page_nums = set(p.get("page_num", 0) for p in cover_pages)
@@ -1568,7 +1619,8 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                                     _nc_lower = name_candidate.lower()
                                     if (len(name_candidate) >= 2 and len(name_candidate) <= 60
                                             and not any(k in _nc_lower for k in _bad_kw)
-                                            and not name_candidate.isdigit()):
+                                            and not name_candidate.isdigit()
+                                            and not _looks_like_header_row(name_candidate)):
                                         result["material_name"] = name_candidate
                                         result["page_num"] = tbl_page
                                     break
@@ -1579,7 +1631,8 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                                     _bad_kw = ['supplier', 'model', 'number', 'remark', 'version']
                                     if (len(name_candidate) >= 2 and len(name_candidate) <= 50
                                             and not any(k in name_candidate.lower() for k in _bad_kw)
-                                            and not name_candidate.isdigit()):
+                                            and not name_candidate.isdigit()
+                                            and not _looks_like_header_row(name_candidate)):
                                         result["material_name"] = name_candidate
                                         result["page_num"] = tbl_page
                                     break
@@ -1635,9 +1688,11 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                     name_val = name_match.group(1).strip()
                     name_lower = name_val.lower()
                     _is_label_like = any(kw in name_lower for kw in _label_keywords)
+                    # V5.9.3: 拒绝像表格表头行的值（如"零件描述 供应商名称 供应商型号 数量..."）
                     if (len(name_val) >= 3 and not name_val.isdigit()
                             and not _is_label_like
-                            and len(name_val) <= 60):
+                            and len(name_val) <= 60
+                            and not _looks_like_header_row(name_val)):
                         result["material_name"] = name_val
 
             if result["part_number"] or result["material_name"]:
@@ -1660,7 +1715,8 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                         _spm_label_kw = ['supplier', 'model', 'number', 'remark', 'version']
                         if (len(candidate) >= 2 and len(candidate) <= 50
                                 and not any(k in candidate.lower() for k in _spm_label_kw)
-                                and not candidate.isdigit()):
+                                and not candidate.isdigit()
+                                and not _looks_like_header_row(candidate)):
                             result["material_name"] = candidate
                             break
                 if result["material_name"]:
@@ -1685,6 +1741,13 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                 "sample acknowledgement", "样品承认书", "product name",
                 "material number", "产品名称", "物料编号"
             ])
+            # V5.9.3: 排除BOM/目录表，避免误判为封面表格
+            _is_bom_or_catalog = any(kw in _tbl_text.lower() for kw in [
+                "bill of material", "物料清单", "catalog", "目录",
+                "item number", "supplier model", "供应商型号", "零件料号"
+            ])
+            if _is_bom_or_catalog:
+                _is_cover_tbl = False
 
             # 在表格中搜索 K+数字 字母格式（如 K6970000223LA）
             for row in tbl:
@@ -1716,7 +1779,8 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                                             'material', 'version', 'description']
                                 if (len(_candidate) >= 2 and len(_candidate) <= 50
                                         and not any(k in _candidate.lower() for k in _label_kw)
-                                        and not _candidate.isdigit()):
+                                        and not _candidate.isdigit()
+                                        and not _looks_like_header_row(_candidate)):
                                     result["material_name"] = _candidate
                                     break
 
@@ -1724,6 +1788,16 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                     break
             if result["part_number"] and result["material_name"]:
                 break
+
+    # V5.9.3: 最终校验 - 如果提取到的物料名称只是标签文字（如"产品名称""零件名称"），清空它
+    if result["material_name"]:
+        _mn = result["material_name"].strip()
+        _label_only_patterns = [
+            r'^产品名称$', r'^零件名称$', r'^物料名称$', r'^part\s*name$',
+            r'^产品$', r'^名称$', r'^description$'
+        ]
+        if any(re.match(pat, _mn, re.IGNORECASE) for pat in _label_only_patterns):
+            result["material_name"] = ""
 
     return result
 
@@ -2486,9 +2560,9 @@ def generate_final_verdict_v62(material_type, all_results, standards):
     if screw_check.get("is_screw") and screw_check.get("issues"):
         issues.extend(screw_check["issues"])
 
-    # V5.9.2: 封面供应商信息完整性问题
+    # V5.9.2: 封面供应商信息完整性问题（V5.9.3: 仅❌状态才计入issues）
     supplier_check = all_results.get("supplier_check", {})
-    if supplier_check.get("issues"):
+    if supplier_check.get("overall_status", "").startswith("❌") and supplier_check.get("issues"):
         issues.extend(supplier_check["issues"])
 
     total_fail = completeness.get("fail_count", 0)
@@ -2899,7 +2973,7 @@ with col2:
         if not all_paths:
             st.warning("⚠️ 请先上传或选择PDF文件")
         else:
-            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.9.2: 新增封面供应商信息完整性检查)")
+            st.info(f"开始审核 **{len(all_paths)}** 个文件... (V5.9.3: 修复供应商信息检查对无文本/图片型封面的误报)")
 
             progress = st.progress(0)
             detail_results = []
