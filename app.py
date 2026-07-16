@@ -1393,8 +1393,9 @@ def inspect_cpk_compliance(page_analysis, standards, pdf_text, tables=None):
         if not all_pass:
             results["issues"].append(f"CPK值不合格：最小值 {min_val:.2f}，要求 ≥ 1.33")
     else:
-        results["sub_items"]["3.1_CPK值"] = "⏱ 未检测到CPK数据"
-        results["issues"].append("未在PDF中找到CPK值数据")
+        results["sub_items"]["3.1_CPK值"] = "⏱ 未检测到CPK数据（PDF无可提取文本，可能为扫描件）"
+        results["issues"].append("未在PDF中找到CPK值数据（可能是扫描件/图片型PDF，无法自动提取）")
+        results["overall_status"] = "⚠️ 需人工确认"
 
     # 3.2 CPK报告与图纸/全尺寸报告尺寸对应性
     has_cpk_page = any(p.get("is_cpk") for p in page_analysis)
@@ -1405,8 +1406,10 @@ def inspect_cpk_compliance(page_analysis, standards, pdf_text, tables=None):
         else "⏱ 需人工确认CPK与图纸对应关系"
     )
 
-    has_critical_issue = any("CPK值不合格" in issue or "未找到CPK" in issue for issue in results["issues"])
-    results["overall_status"] = "✅ 通过" if not has_critical_issue else "❌ 不合格"
+    # 无CPK数据时已在上面设为⚠️；有数据时根据是否合格判定
+    if results["overall_status"] != "⚠️ 需人工确认":
+        has_critical_issue = any("CPK值不合格" in issue for issue in results["issues"])
+        results["overall_status"] = "✅ 通过" if not has_critical_issue else "❌ 不合格"
 
     return results
 
@@ -3066,9 +3069,9 @@ with col2:
 
             # 统计概览
             col_s1, col_s2, col_s3 = st.columns(3)
-            pass_count = sum(1 for r in detail_results if "合格" in r["总体结论"])
-            fail_count = sum(1 for r in detail_results if "不合格" in r["总体结论"])
-            warn_count = len(detail_results) - pass_count - fail_count
+            pass_count = sum(1 for r in detail_results if r["总体结论"].startswith("✅"))
+            fail_count = sum(1 for r in detail_results if r["总体结论"].startswith("❌"))
+            warn_count = sum(1 for r in detail_results if r["总体结论"].startswith("⚠️"))
 
             with col_s1:
                 st.metric("✅ 合格", pass_count, delta_color="normal")
