@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.5
+封样检验Web应用 - V5.9.6
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
 V5.1优化：内存管理（gc.collect）、文本截断、实时状态更新、大文件稳定性提升
 V5.3修复：KeyError崩溃防护、Excel错误汇总sheet、大文件稳定性、文件去重
 V5.9.5优化：使用pypdfium2预提取文本，170页大PDF审核从90秒降至4秒
+V5.9.6修复：封面料号误提取为标签词（PART）；支持R/M/S/NC/XC/K等多前缀文件名料号提取；表头标签行料号提取
 """
 
 import streamlit as st
@@ -1828,6 +1829,18 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
         if any(re.match(pat, _mn, re.IGNORECASE) for pat in _label_only_patterns):
             result["material_name"] = ""
 
+    # V5.9.6: 最终校验 - 过滤掉误提取的纯标签词（如"PART"、"NO"、"Material"等）
+    if result["part_number"]:
+        _pn = result["part_number"].strip()
+        _pn_clean = re.sub(r'[\s\-_]', '', _pn.lower())
+        _label_only_words = {
+            "part", "no", "number", "material", "item", "物料", "料号",
+            "编号", "零件号", "materialnumber", "partnumber", "partno", "no."
+        }
+        if (_pn_clean in _label_only_words or
+                len(re.findall(r'\d', _pn)) < 4):
+            result["part_number"] = ""
+
     return result
 
 
@@ -1953,6 +1966,38 @@ def extract_table_headers_part_info(page_analysis, tables=None):
                         not re.search(r'\d', cell) for cell in non_empty_cells
                     ):
                         header_row_indices.add(ri)
+
+            # === V5.9.6: 在表头行中扫描 Part NO / Material Number / 料号 标签及其相邻值 ===
+            # 很多报告（全尺寸测量报告、CPK报告、BOM）的料号就写在表头标签行中，
+            # 若仅跳过表头行，会漏掉这些关键信息。
+            for ri, row in enumerate(table[:6]):
+                if not row:
+                    continue
+                for ci, cell in enumerate(row):
+                    if cell is None:
+                        continue
+                    cell_str = str(cell).strip()
+                    cell_lower = cell_str.lower()
+                    # 判断当前单元格是否是料号标签，且本身不包含有效料号
+                    is_pn_label = (
+                        re.search(r'part\s*(?:no\.?|number)|料号|零件号|material\s*(?:number|no\.?)|物料编号', cell_lower)
+                        and not re.search(r'[A-Za-z]{0,2}\d{6,}', cell_str)
+                    )
+                    if is_pn_label and ci + 1 < len(row):
+                        for next_cell in row[ci + 1:]:
+                            if next_cell is not None and str(next_cell).strip():
+                                nv = str(next_cell).strip()
+                                # 验证是否为有效料号（允许 R/M/S/NC/XC/K 等前缀）
+                                if re.match(r'^[A-Za-z]{0,2}\d{6,}[\w\-]*$', nv):
+                                    part_number = nv
+                                    break
+                                elif re.match(r'^[A-Za-z0-9_\-]{7,}$', nv):
+                                    part_number = nv
+                                    break
+                        if part_number:
+                            break
+                if part_number:
+                    break
 
             # === V5.8.7: 在非表头行的数据区域搜索料号和名称 ===
             for ri, row in enumerate(table):
@@ -2369,11 +2414,12 @@ def check_catalog_checkboxes(pdf_path, page_analysis, tables=None):  # V5.5: 接
     return result
 
 
-def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4: 接受预提取tables
+def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_name=None):  # V5.4: 接受预提取tables; V5.9.6: 增加file_name
     """
     V6.2 功能2：料号&物料名称跨表一致性检查
     提取封面和各表头的料号/物料名称，比对一致性
     V5.4优化: 接受预提取的tables参数，避免重新打开PDF
+    V5.9.6优化: 优先使用原始文件名(file_name)提取文件名料号，避免Cloud临时路径导致文件名丢失
     返回: dict with consistency results
     """
     result = {
@@ -2384,9 +2430,25 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4
         "issues": [],
     }
 
+    # V5.9.6: 预提取文件名料号（支持多种料号前缀：R/M/S/NC/XC/K 等）
+    # 优先使用调用方传入的原始 file_name，避免Cloud临时路径导致文件名丢失
+    _fname = (file_name if file_name else os.path.basename(pdf_path)) if file_name or pdf_path else ""
+    _fn_pn_match = re.search(r'([A-Za-z]{1,2}\d{8,}[A-Za-z]*)', _fname, re.IGNORECASE)
+    _fn_pn = None
+    if _fn_pn_match:
+        _fn_pn = _fn_pn_match.group(1).upper().replace(" ", "").replace("-", "")
+    result["filename_part_number"] = _fn_pn  # 供UI/Excel展示
+
     # Step 1: 提取封面的料号和物料名称
     cover = extract_cover_info(page_analysis, pdf_path, tables=tables)
     result["cover_info"] = cover
+
+    # V5.9.6: 封面提取失败或只提取到标签词时，用文件名料号作为参考
+    _cover_pn_valid = bool(cover["part_number"] and len(re.findall(r'\d', cover["part_number"])) >= 4)
+    if not _cover_pn_valid and _fn_pn:
+        cover = dict(cover)
+        cover["part_number"] = _fn_pn
+        result["cover_info"] = cover
 
     if not cover["part_number"] and not cover["material_name"]:
         result["overall_status"] = "⏱ 无法提取封面信息"
@@ -2486,15 +2548,7 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None):  # V5.4
         result["consistency_checks"].append(check_result)
 
     # Step 4: V5.9.1 新增 —— 文件名料号 vs 文档内容料号一致性检查
-    # 用户场景：文件命名为 CRS_K5350000042LA_...pdf，但文档内料号为 K5311000042LA，
-    # 这类"文不对题"的命名错误需在料号一致性检查中暴露出来
-    _fname = os.path.basename(pdf_path)
-    _fn_pn_match = re.search(r'(K\d{6,}[A-Za-z]*)', _fname, re.IGNORECASE)
-    _fn_pn = None
-    if _fn_pn_match:
-        _fn_pn = _fn_pn_match.group(1).upper().replace(" ", "").replace("-", "")
-    result["filename_part_number"] = _fn_pn  # 供UI/Excel展示
-
+    # V5.9.6: 文件名料号已在上文提取，这里直接复用 _fn_pn
     if _fn_pn:
         # 4.1 与封面料号比对
         if ref_pn:
@@ -2696,7 +2750,7 @@ def run_full_inspection(file_path, file_name, standards):
 
     # V6.2 新增：目录勾选状态检测 + 料号跨表一致性检查
     catalog_check = check_catalog_checkboxes(file_path, page_analysis, tables=tables)  # V5.5: 传入预提取表格
-    part_consistency = check_part_number_consistency(page_analysis, file_path, tables=tables)  # V5.4: 传入预提取表格
+    part_consistency = check_part_number_consistency(page_analysis, file_path, tables=tables, file_name=file_name)  # V5.4/V5.9.6: 传入预提取表格和原始文件名
 
     # V5.9.0 新增：螺丝/紧固件类物料工程图纸特殊要求检查
     _cover_name = part_consistency.get("cover_info", {}).get("material_name", "")
