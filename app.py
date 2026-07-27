@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.6
+封样检验Web应用 - V5.9.7
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
 V5.1优化：内存管理（gc.collect）、文本截断、实时状态更新、大文件稳定性提升
 V5.3修复：KeyError崩溃防护、Excel错误汇总sheet、大文件稳定性、文件去重
 V5.9.5优化：使用pypdfium2预提取文本，170页大PDF审核从90秒降至4秒
-V5.9.6修复：封面料号误提取为标签词（PART）；支持R/M/S/NC/XC/K等多前缀文件名料号提取；表头标签行料号提取
+V5.9.7修复：文件名料号使用词边界避免误提取厂商编码（如LMIWH055121571）；封面Product name长名称物料名称提取；BOM组成部件不参与物料名称对比
 """
 
 import streamlit as st
@@ -1635,26 +1635,27 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                                         result["page_num"] = tbl_page
                                     break
 
-                    # 物料名称匹配：Product name / 产品名称 标签行
+                    # 物料名称匹配：Product name / 产品名称 标签行（V5.9.7优先且放宽长度限制）
                     if not result["material_name"]:
                         if re.search(r'product\s*name|产品名称', cell_str, re.IGNORECASE):
                             # 标签单元格，值在右侧相邻单元格
                             for nc in row[ci+1:]:
                                 if nc is not None and str(nc).strip():
                                     name_candidate = str(nc).strip()
-                                    # 过滤：不能是标签文字、长度合理
+                                    # 过滤：不能是标签文字、长度合理（产品名称可能较长，如 80+ 字符）
                                     _bad_kw = ['supplier', 'model', 'number', 'remark',
                                                'version', 'description', '规格', '日期',
                                                'rev', '料号', '物料', '编号']
                                     _nc_lower = name_candidate.lower()
-                                    if (len(name_candidate) >= 2 and len(name_candidate) <= 60
+                                    if (len(name_candidate) >= 2 and len(name_candidate) <= 200
                                             and not any(k in _nc_lower for k in _bad_kw)
                                             and not name_candidate.isdigit()
                                             and not _looks_like_header_row(name_candidate)):
                                         result["material_name"] = name_candidate
                                         result["page_num"] = tbl_page
                                     break
-                        elif re.search(r'supplier\s*product\s*model|供應商產品型號|供应商产品型号|型号', cell_str, re.IGNORECASE):
+                        # V5.9.7: Product name 未命中时才回退到供应商产品型号
+                        if not result["material_name"] and re.search(r'supplier\s*product\s*model|供應商產品型號|供应商产品型号|型号', cell_str, re.IGNORECASE):
                             for nc in row[ci+1:]:
                                 if nc is not None and str(nc).strip():
                                     name_candidate = str(nc).strip()
@@ -1701,17 +1702,18 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                     result["part_number"] = pn_match.group(1).strip()
                     result["page_num"] = p["page_num"]
 
-                # 物料名称匹配（V5.8.3修复：优先Product name，回退Supplier Product Model）
+                # 物料名称匹配（V5.9.7修复：优先Product name，放宽长度并兼容行尾结束）
                 _label_keywords = ['supplier', 'model', 'number', 'remark', 'material',
                                    'version', 'description', '规格', '日期', 'date',
                                    'rev', '料号', '物料', '编号', '版本']
+                # 优先严格匹配 Product name / 产品名称，允许值直到行尾或至少1个空白分隔
                 name_match = re.search(
-                    r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*(.+?)\s{2,}',
+                    r'(?:Product\s*(?:name|名称)|产品名称)[\s:：]*(.+?)(?:\s{2,}|\s*$)',
                     line, re.IGNORECASE
                 )
                 if not name_match:
                     name_match = re.search(
-                        r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：\s]*([^\n\r]{3,60})',
+                        r'(?:Product\s*(?:name|名称)|产品名称|Description|零件名称|物料名称|Part\s*name\s*/?\s*model|零件名称/型号)[\s:：]*([^\n\r]{3,200})',
                         line, re.IGNORECASE
                     )
                 if name_match and not result["material_name"]:
@@ -1721,7 +1723,7 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                     # V5.9.3: 拒绝像表格表头行的值（如"零件描述 供应商名称 供应商型号 数量..."）
                     if (len(name_val) >= 3 and not name_val.isdigit()
                             and not _is_label_like
-                            and len(name_val) <= 60
+                            and len(name_val) <= 200
                             and not _looks_like_header_row(name_val)):
                         result["material_name"] = name_val
 
@@ -1857,6 +1859,20 @@ def extract_table_headers_part_info(page_analysis, tables=None):
     格式: [{"table_type": str, "part_number": str, "material_name": str, "page_num": int}, ...]
     """
     table_infos = []
+
+    # V5.9.7: 本地辅助函数，判断字符串是否像表格表头行
+    def _looks_like_header_row(val):
+        if not val or len(val.strip()) < 5:
+            return False
+        v_lower = val.lower()
+        header_keywords = [
+            "supplier", "供应商", "model", "型号", "number", "数量",
+            "remark", "备注", "description", "描述", "name", "名称",
+            "date", "日期", "part", "零件", "material", "物料", "rosh", "rohs",
+            "yes", "no", "是", "否", "item", "序号"
+        ]
+        kw_count = sum(1 for kw in header_keywords if kw in v_lower)
+        return kw_count >= 4
 
     # V5.4: 使用预提取的表格，不重新打开PDF
     if not tables:
@@ -1996,7 +2012,23 @@ def extract_table_headers_part_info(page_analysis, tables=None):
                                     break
                         if part_number:
                             break
-                if part_number:
+
+                    # V5.9.7: 样品承认书表格中直接扫描 Product name / 产品名称 标签行
+                    if table_type == "样品承认书" and not material_name:
+                        if re.search(r'product\s*name|产品名称', cell_str, re.IGNORECASE):
+                            for next_cell in row[ci + 1:]:
+                                if next_cell is not None and str(next_cell).strip():
+                                    nv = str(next_cell).strip()
+                                    if (len(nv) >= 2 and len(nv) <= 200
+                                            and not nv.isdigit()
+                                            and not _looks_like_header_row(nv)):
+                                        material_name = nv
+                                        break
+                            if material_name:
+                                break
+                if part_number and material_name:
+                    break
+                if part_number and table_type != "样品承认书":
                     break
 
             # === V5.8.7: 在非表头行的数据区域搜索料号和名称 ===
@@ -2140,6 +2172,10 @@ def extract_table_headers_part_info(page_analysis, tables=None):
                                 (cn_count >= 3 or has_long_us)):
                             material_name = candidate
 
+            # V5.9.7: 物料清单(BOM)中的名称是组成部件，不应作为封面物料名称参考
+            if table_type == "物料清单":
+                material_name = ""
+
             # V5.8.7: 只有提取到有效料号或有效名称时才添加结果
             # 过滤掉明显无效的结果（如表头标题、说明文字等）
             _is_valid_pn = bool(part_number and re.match(r'^[A-Za-z]{0,2}\d{6,}[\w\-]*$', part_number))
@@ -2164,7 +2200,7 @@ def extract_table_headers_part_info(page_analysis, tables=None):
                 cn_count = len(re.findall(r'[\u4e00-\u9fff]', material_name))
                 _is_valid_name = (not _is_name_bad_prefix and
                                   (cn_count >= 3 or ('_' in material_name and len(material_name) >= 15)) and
-                                  len(material_name) <= 80)
+                                  len(material_name) <= 200)
 
             if (_is_valid_pn or _is_valid_name):
                 table_infos.append({
@@ -2430,10 +2466,15 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
         "issues": [],
     }
 
-    # V5.9.6: 预提取文件名料号（支持多种料号前缀：R/M/S/NC/XC/K 等）
+    # V5.9.7: 预提取文件名料号（支持多种料号前缀：R/M/S/NC/XC/K 等）
     # 优先使用调用方传入的原始 file_name，避免Cloud临时路径导致文件名丢失
+    # 关键：使用负向回顾/前瞻，避免从厂商长编码（如 LMIWH055121571）中误提取 WH055121571
     _fname = (file_name if file_name else os.path.basename(pdf_path)) if file_name or pdf_path else ""
-    _fn_pn_match = re.search(r'([A-Za-z]{1,2}\d{8,}[A-Za-z]*)', _fname, re.IGNORECASE)
+    _fn_pn_match = re.search(
+        r'(?<![A-Za-z])([A-Za-z]{1,2}\d{8,}[A-Za-z]{0,2})(?![A-Za-z0-9])',
+        _fname,
+        re.IGNORECASE
+    )
     _fn_pn = None
     if _fn_pn_match:
         _fn_pn = _fn_pn_match.group(1).upper().replace(" ", "").replace("-", "")
@@ -2516,8 +2557,11 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
             check_result["pn_match"] = "⏱ 无参考"
             check_result["pn_detail"] = ""
 
-        # 物料名称比对
-        if ref_name and table_name:
+        # 物料名称比对（V5.9.7：BOM表格的组成部件名称不做对比）
+        if table_type == "物料清单":
+            check_result["name_match"] = "⏱ BOM组成部件不对比"
+            check_result["name_detail"] = "物料清单为组成部件，不参与物料名称一致性对比"
+        elif ref_name and table_name:
             # V5.8.7: 标准化比较（忽略大小写、空格、换行、全角半角差异）
             import re as _re
             name_normalized_ref = _re.sub(r'[\s\n\r\t－_]', '', ref_name.upper())
@@ -2546,6 +2590,12 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
             check_result["name_detail"] = ""
 
         result["consistency_checks"].append(check_result)
+
+    # V5.9.7: 过滤掉因BOM组成部件名称产生的物料名称差异issue
+    result["issues"] = [
+        issue for issue in result["issues"]
+        if not ("物料清单" in issue and "物料名称" in issue)
+    ]
 
     # Step 4: V5.9.1 新增 —— 文件名料号 vs 文档内容料号一致性检查
     # V5.9.6: 文件名料号已在上文提取，这里直接复用 _fn_pn
