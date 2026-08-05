@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.7
+封样检验Web应用 - V5.9.9
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
 V5.1优化：内存管理（gc.collect）、文本截断、实时状态更新、大文件稳定性提升
 V5.3修复：KeyError崩溃防护、Excel错误汇总sheet、大文件稳定性、文件去重
 V5.9.5优化：使用pypdfium2预提取文本，170页大PDF审核从90秒降至4秒
+V5.9.8新增：LCD显示模组专项检查（BOM组成完整性、工程图DOL≥40/4PB≥600/色坐标/接地阻抗规格）；报告逐项时效性检查（逐行核对RoHS/SGS报告日期≤365天，修复max日期遮罩旧报告bug）
 V5.9.7修复：文件名料号使用词边界避免误提取厂商编码（如LMIWH055121571）；封面Product name长名称物料名称提取；BOM组成部件不参与物料名称对比
+V5.9.9修复：QCP（Quality Control Plan）识别为CPK等价文档，解决QCP页面CPK显示缺失；RoHS/REACH测试报告检测增加中文匹配兜底（避免all_text截断导致英文关键词丢失）；表格提取范围扩展至35页覆盖后置管控文档
 """
 
 import streamlit as st
@@ -210,6 +212,7 @@ def analyze_pdf_page_by_page(pdf_path):
                         page_info["is_sample_photo"] = True
 
                     # --- CPK报告页判定（V6.1 增强：支持表格形式/繁体中文/多种格式）---
+                    # V5.9.9: 同时识别 QCP（Quality Control Plan / 品质管制计划）为 CPK 等价文档
                     cpk_indicators = [
                         r'cp[kK]\s*[:：=]',                    # cpk: / cpk= / cpk：
                         r'cp[kK]\s*報告',                      # 繁体 CPK報告
@@ -218,6 +221,11 @@ def analyze_pdf_page_by_page(pdf_path):
                         r'cp[kK]\s*值',                        # CPK值
                         r'cp[kK]\s*[\(（].*?[\)）]',          # CPK(xxx)
                         r'^.*cp[kK].*$',                       # 任意含CPK的行（宽泛匹配）
+                    ]
+                    qcp_indicators = [
+                        'quality control plan', 'qcp',
+                        '品质管制计划', '品质管控计划', '品质工程',
+                        'qc flow chart', '制程管控', 'process qc',
                     ]
                     # 宽松匹配：页面文本中只要包含 CPK/Cpk 关键词即判定
                     if re.search(r'cp[kK]', text_lower):
@@ -230,6 +238,11 @@ def analyze_pdf_page_by_page(pdf_path):
                         ])
                         if cpk_count >= 2 or has_cpk_context:
                             page_info["is_cpk"] = True
+
+                    # V5.9.9: QCP 作为 CPK 等价文档（Quality Control Plan 是制程能力管控文件）
+                    if not page_info.get("is_cpk") and any(qi in text_lower for qi in qcp_indicators):
+                        page_info["is_qcp"] = True
+                        page_info["is_cpk"] = True  # QCP 视同 CPK 报告
 
                     # --- RoHS调查表页判定 ---
                     if "rohs" in text_lower and ("调查表" in text or "survey" in text_lower):
@@ -250,13 +263,15 @@ def analyze_pdf_page_by_page(pdf_path):
                     if spec_score >= 2:
                         page_info["is_product_spec"] = True
 
-                    # V5.4: 只在前30页提取表格 + 仅当页面有关键词时（大幅减少内存）
+                    # V5.4: 只在前N页提取表格 + 仅当页面有关键词时（大幅减少内存）
+                    # V5.9.9: 扩展到35页以覆盖QCP等后置管控文档；增加qcp关键词
                     _should_extract_tbl = (
-                        page_idx < 30 and (
-                            re.search(r'cp[kK]|rohs|reach|catalog|目录|料号|part.?number',
+                        page_idx < 35 and (
+                            re.search(r'cp[kK]|rohs|reach|catalog|目录|料号|part.?number|qcp|quality control|品质管制',
                                       text_lower) or
                             page_info.get("is_cover") or
                             page_info.get("is_cpk") or
+                            page_info.get("is_qcp") or
                             page_info.get("is_rohs_survey")
                         )
                     )
@@ -280,7 +295,7 @@ def analyze_pdf_page_by_page(pdf_path):
                         "text_lower": "",
                         "is_cover": False, "is_engineering_drawing": False,
                         "is_bom": False, "is_sample_photo": False,
-                        "is_cpk": False, "is_rohs_survey": False,
+                        "is_cpk": False, "is_qcp": False, "is_rohs_survey": False,
                         "is_reach_survey": False, "is_product_spec": False,
                         "drawing_number": "", "drawing_version": "",
                         "dimensions": [],
@@ -1176,7 +1191,9 @@ def inspect_file_completeness_v4(page_analysis, material_type, standards):
             # 全尺寸报告通常含尺寸测量表格
             found = "全尺寸" in all_text or "full size" in all_text or "measurement report" in all_text
         elif "Cpk" in name or "Cpk Report" in english:
-            found = has_cpk
+            # V5.9.9: QCP（Quality Control Plan）视同 CPK 报告
+            has_qcp = any(p.get("is_qcp") for p in page_analysis)
+            found = has_cpk or has_qcp
         elif "产品规格书" in name or "Product Specification" in english:
             found = spec_status != "缺失"
             item_note = spec_note
@@ -1194,12 +1211,25 @@ def inspect_file_completeness_v4(page_analysis, material_type, standards):
             found = "材质证明" in all_text or "material certificate" in all_text or "sgs" in all_text
         elif "RoHS" in name and "调查表" in name:
             found = has_rohs
-        elif "RoHS" in name and "测试报告" in name:
-            found = "rohs" in all_text and "test report" in all_text
+        elif "RoHS" in name and ("测试报告" in name or "独立报告" in name):
+            # V5.9.9: 中英文双重匹配，避免 all_text 截断导致英文关键词丢失
+            found = (
+                ("rohs" in all_text and "test report" in all_text) or
+                ("rohs" in all_text and "测试报告" in all_text) or
+                has_rohs
+            )
         elif "REACH" in name and "调查表" in name:
-            found = has_reach
-        elif "REACH" in name and "测试报告" in name:
-            found = "reach" in all_text and "test report" in all_text
+            # V5.9.9: 放宽 REACH 调查表检测（部分 PDF 用中文标题如 REACH物质成分调查表）
+            found = has_reach or (
+                "reach" in all_text and ("调查表" in all_text or "survey" in all_text or
+                 "物质成分" in all_text or "svhc" in all_text)
+            )
+        elif "REACH" in name and ("测试报告" in name or "独立报告" in name):
+            # V5.9.9: 中英文双重匹配
+            found = (
+                ("reach" in all_text and "test report" in all_text) or
+                ("reach" in all_text and "测试报告" in all_text)
+            )
         else:
             # 通用关键词匹配
             fnd, _ = check_keyword_in_text(all_text, [name, english])
@@ -1404,6 +1434,9 @@ def inspect_cpk_compliance(page_analysis, standards, pdf_text, tables=None):
 
     all_text = " ".join(p.get("text", "") for p in page_analysis)
 
+    # V5.9.9: 检查是否有 QCP（Quality Control Plan）页面
+    has_qcp = any(p.get("is_qcp") for p in page_analysis)
+
     # 3.1 提取CPK值（V6.1: 传入tables以避免重复打开PDF）
     cpk_values = extract_cpk_values(all_text, tables=tables)
     results["cpk_values"] = cpk_values
@@ -1420,8 +1453,13 @@ def inspect_cpk_compliance(page_analysis, standards, pdf_text, tables=None):
         if not all_pass:
             results["issues"].append(f"CPK值不合格：最小值 {min_val:.2f}，要求 ≥ 1.33")
     else:
-        results["sub_items"]["3.1_CPK值"] = "⏱ 未检测到CPK数据（PDF无可提取文本，可能为扫描件）"
-        results["issues"].append("未在PDF中找到CPK值数据（可能是扫描件/图片型PDF，无法自动提取）")
+        # V5.9.9: 区分"完全无CPK/QCP文档"和"有QCP但无法提取数值"
+        if has_qcp:
+            results["sub_items"]["3.1_CPK值"] = "⏱ 检测到QCP（Quality Control Plan），但无法自动提取CPK数值（需人工确认制程能力）"
+            results["issues"].append("检测到Quality Control Plan文档，但该格式不含标准CPK值字段，需人工核对制程管控参数")
+        else:
+            results["sub_items"]["3.1_CPK值"] = "⏱ 未检测到CPK数据（PDF无可提取文本，可能为扫描件）"
+            results["issues"].append("未在PDF中找到CPK值数据（可能是扫描件/图片型PDF，无法自动提取）")
         results["overall_status"] = "⚠️ 需人工确认"
 
     # 3.2 CPK报告与图纸/全尺寸报告尺寸对应性
@@ -1530,6 +1568,282 @@ def inspect_report_validity(page_analysis, standards, check_date):
         results["sub_items"]["5.1_RoHS报告时效性"] = "⏱ 未检测到报告日期"
         results["sub_items"]["5.2_REACH报告时效性"] = "⏱ 未检测到报告日期"
 
+    return results
+
+
+# ============================================================
+# V5.9.8 新增：LCD显示模组专项检查 + 报告逐项时效性检查
+# ============================================================
+
+def is_lcd_component(material_name="", file_name="", content_hint=""):
+    """
+    V5.9.8: 根据物料名称/文件名/内容关键词判定是否为LCD显示模组类物料。
+    用于决定是否启用 LCD 专属检查（BOM组成、工程图规格）。
+    返回: (bool, matched_keyword)
+    """
+    lcd_keywords = [
+        "touch panel", "display", "lcd", "tft", "oled", "module", "monitor",
+        "触摸屏", "触控", "显示模组", "液晶", "模组", "主屏", "屏",
+    ]
+    texts = []
+    if material_name:
+        texts.append(material_name.lower())
+    if file_name:
+        texts.append(file_name.lower())
+    if content_hint:
+        texts.append(content_hint.lower())
+    combined = " ".join(texts)
+    for kw in lcd_keywords:
+        if kw in combined:
+            return True, kw
+    return False, None
+
+
+def _lcd_bom_has(text_lower, variants):
+    """辅助：按字面或正则(~开头)匹配BOM关键词（短码用词边界避免bill误命中bl）"""
+    for v in variants:
+        if v.startswith("~"):
+            if re.search(v[1:], text_lower):
+                return True
+        elif v in text_lower:
+            return True
+    return False
+
+
+def check_lcd_bom_composition(page_analysis, tables=None):
+    """
+    V5.9.8: LCD显示模组物料清单(BOM)组成完整性检查。
+    检查BOM中是否包含LCD模组的关键组成物料信息：
+      FPC空板、CG(盖板/Cover Glass)、BL(背光源)、导电银浆、一线胶、面胶。
+    仅对LCD类物料启用。
+    返回: dict
+    """
+    results = {
+        "is_lcd_bom_check": True,
+        "overall_status": "✅ 通过",
+        "issues": [],
+        "sub_items": {},
+        "missing": [],
+        "present": [],
+    }
+    # 收集BOM文本（页面标记 + 表格）
+    bom_texts = []
+    for p in page_analysis:
+        if p.get("is_bom"):
+            bom_texts.append(p.get("text", ""))
+    if tables:
+        for t_dict in tables:
+            tbl = t_dict.get("table", [])
+            if not tbl:
+                continue
+            first = " ".join(str(c) if c else "" for c in tbl[0]).lower()
+            # 仅当首页含BOM强特征关键词时才视为物料清单表，
+            # 避免RoHS/SGS/工程图等表中出现的"item/报告检测时间"等误命中
+            if ("物料清单" in first or "bill of material" in first
+                    or "零件料号" in first or "part material number" in first
+                    or "零件名称" in first or "part name" in first):
+                for row in tbl:
+                    bom_texts.append(" ".join(str(c) if c else "" for c in row))
+    combined_lower = " ".join(bom_texts).lower()
+
+    # 短码BL/CG用词边界正则，避免 "bill" 误命中 "bl"、"drawing" 等误命中 "cg"
+    required = [
+        ("FPC空板", ["fpc空板", "fpc bare", "空板"]),
+        ("CG盖板/Cover Glass", ["~\\bcg\\b", "盖板", "cover glass"]),
+        ("BL背光源", ["~\\bbl\\b", "背光源", "背光"]),
+        ("导电银浆", ["导电银浆", "银浆", "silver paste"]),
+        ("一线胶", ["一线胶", "底胶", "primer", "底涂"]),
+        ("面胶/边框胶", ["面胶", "边框胶", "框胶"]),
+    ]
+    for name, variants in required:
+        if _lcd_bom_has(combined_lower, variants):
+            results["present"].append(name)
+            results["sub_items"][f"BOM含{name}"] = "✅ 已包含"
+        else:
+            results["missing"].append(name)
+            results["sub_items"][f"BOM含{name}"] = "❌ 缺失"
+            results["issues"].append(f"物料清单缺少{name}相关信息")
+    if results["missing"]:
+        results["overall_status"] = "❌ 不合格"
+    return results
+
+
+def check_lcd_drawing_specs(page_analysis, pdf_path=None):
+    """
+    V5.9.8: LCD工程图纸关键规格校验（仅LCD启用）。
+    校验：
+      3.1 CG DOL≥40um（常见误填≥35um）
+      3.2 四点弯折 4PB≥600Mpa（常见误填≥500Mpa）
+      3.3 色坐标管控规格需明确（不得标注"待确认"）
+      3.4 FPC-BTB补强钢片接地阻抗≤3Ω 管控规格需存在
+    注意：工程图文本层在分页存储时会被截断(>1500字符)，故对图纸页重新用
+          pypdfium2 提取完整文本后再做规格值解析。
+    """
+    results = {
+        "is_lcd_drawing_check": True,
+        "overall_status": "✅ 通过",
+        "issues": [],
+        "sub_items": {},
+    }
+    # 收集工程图纸页号
+    drawing_pages = [p["page_num"] for p in page_analysis if p.get("is_engineering_drawing")]
+    if not drawing_pages:
+        for p in page_analysis:
+            if re.search(r'mechanical\s*drawing|结构图|工程图', (p.get("text") or ""), re.I):
+                drawing_pages.append(p["page_num"])
+
+    # 提取完整文本（优先pypdfium2重提图纸页，避免截断丢失DOL/4PB/接地阻抗）
+    full_text = ""
+    if pdf_path:
+        try:
+            doc = pdfium.PdfDocument(pdf_path)
+            for pn in drawing_pages:
+                if 1 <= pn <= len(doc):
+                    tp = doc[pn - 1].get_textpage()
+                    full_text += tp.get_text_range() + "\n"
+                    tp.close()
+            doc.close()
+        except Exception:
+            for p in page_analysis:
+                if p.get("is_engineering_drawing"):
+                    full_text += (p.get("text") or "") + "\n"
+    else:
+        for p in page_analysis:
+            if p.get("is_engineering_drawing"):
+                full_text += (p.get("text") or "") + "\n"
+    if not full_text:
+        results["overall_status"] = "⏱ 未检测到工程图文本"
+        results["sub_items"]["工程图文本"] = "⏱ 未提取到工程图文本，无法校验规格"
+        return results
+
+    # 3.1 CG DOL
+    dol_m = re.search(r'DOL\s*[≥>≧]\s*(\d+(?:\.\d+)?)\s*um', full_text, re.I)
+    if dol_m:
+        dol_val = float(dol_m.group(1))
+        if dol_val < 40:
+            results["sub_items"]["3.1_CG_DOL"] = f"❌ CG DOL={dol_val}um < 40um（应≥40um）"
+            results["issues"].append(f"CG DOL规格不足：当前{dol_val}um，应≥40um")
+        else:
+            results["sub_items"]["3.1_CG_DOL"] = f"✅ CG DOL={dol_val}um ≥40um"
+    else:
+        results["sub_items"]["3.1_CG_DOL"] = "⏱ 未检测到CG DOL规格（需人工确认）"
+        results["issues"].append("工程图未检测到CG DOL规格，需人工确认是否≥40um")
+
+    # 3.2 四点弯折 4PB
+    pb_m = re.search(r'4PB\s*[≥>≧]\s*(\d+(?:\.\d+)?)\s*Mpa', full_text, re.I)
+    if pb_m:
+        pb_val = float(pb_m.group(1))
+        if pb_val < 600:
+            results["sub_items"]["3.2_四点弯折4PB"] = f"❌ 4PB={pb_val}Mpa < 600Mpa（应≥600Mpa）"
+            results["issues"].append(f"四点弯折4PB规格不足：当前{pb_val}Mpa，应≥600Mpa")
+        else:
+            results["sub_items"]["3.2_四点弯折4PB"] = f"✅ 4PB={pb_val}Mpa ≥600Mpa"
+    else:
+        results["sub_items"]["3.2_四点弯折4PB"] = "⏱ 未检测到4PB规格（需人工确认）"
+        results["issues"].append("工程图未检测到四点弯折4PB规格，需人工确认是否≥600Mpa")
+
+    # 3.3 色坐标
+    cc_m = re.search(r'色坐标', full_text)
+    if cc_m:
+        ctx = full_text[max(0, cc_m.start() - 10): cc_m.end() + 140]
+        if re.search(r'待确认|tbd|待定|未确认|\(未|\?', ctx, re.I):
+            results["sub_items"]["3.3_色坐标管控"] = "❌ 色坐标管控规格标注为待确认/未明确"
+            results["issues"].append("色坐标管控规格未明确（标注待确认），需明确Y等色坐标管控值")
+        else:
+            results["sub_items"]["3.3_色坐标管控"] = "✅ 色坐标管控规格已明确"
+    else:
+        results["sub_items"]["3.3_色坐标管控"] = "⏱ 未检测到色坐标规格（需人工确认）"
+        results["issues"].append("工程图未检测到色坐标规格，需人工确认")
+
+    # 3.4 FPC-BTB补强钢片接地阻抗
+    if re.search(r'接地阻抗|接地.*阻抗|钢片.*阻抗|阻抗.*钢片', full_text, re.I):
+        results["sub_items"]["3.4_FPC-BTB接地阻抗"] = "✅ 存在FPC-BTB补强钢片接地阻抗管控规格"
+    else:
+        results["sub_items"]["3.4_FPC-BTB接地阻抗"] = "❌ 缺少FPC-BTB补强钢片接地阻抗≤3Ω管控规格"
+        results["issues"].append("缺少FPC-BTB补强钢片接地阻抗≤3Ω管控规格")
+
+    if results["issues"]:
+        results["overall_status"] = "❌ 不合格" if any(
+            "❌" in v for v in results["sub_items"].values()
+        ) else "⚠️ 需人工确认"
+    return results
+
+
+def check_per_item_report_expiry(page_analysis, tables, check_date):
+    """
+    V5.9.8: 报告逐项时效性检查（通用，所有电子料）。
+    对RoHS限用物质调查表、材质证明/SGS报告等表格，逐行核对报告日期是否超过365天。
+    修复此前仅取全文最新日期(max)导致旧报告被遮罩的bug。
+    返回: dict {overall_status, issues, expired_rohs, expired_sgs, sub_items}
+    """
+    results = {
+        "overall_status": "✅ 通过",
+        "issues": [],
+        "expired_rohs": [],
+        "expired_sgs": [],
+        "sub_items": {},
+    }
+    if not tables:
+        return results
+    check_day = check_date.date()
+
+    for t_dict in tables:
+        tbl = t_dict.get("table", [])
+        if not tbl:
+            continue
+        pg = t_dict.get("page")
+        # 用整表文本分类表格类型
+        table_text = " ".join(
+            " ".join(str(c) if c else "" for c in row) for row in tbl
+        ).lower()
+        is_rohs = ("限用物质" in table_text or ("rohs" in table_text and "调查表" in table_text)
+                   or "composition questionnaire" in table_text)
+        is_sgs = ("材质证明" in table_text or "sgs报告" in table_text
+                  or "报告检测时间" in table_text
+                  or ("sgs" in table_text and ("报告" in table_text or "检测" in table_text)))
+        # 若表格文本未命中，用所在页文本兜底判定
+        if not (is_rohs or is_sgs):
+            page_text = ""
+            for p in page_analysis:
+                if p.get("page_num") == pg:
+                    page_text = (p.get("text") or "").lower()
+                    break
+            if "限用物质" in page_text or "composition questionnaire" in page_text:
+                is_rohs = True
+            elif "材质证明" in page_text or "sgs" in page_text:
+                is_sgs = True
+        if not (is_rohs or is_sgs):
+            continue
+
+        # 逐行解析（跳过疑似表头行）
+        for row in tbl:
+            cells = [str(c) if c is not None else "" for c in row]
+            row_text = " ".join(cells)
+            # 名称：含中文且非纯数字/日期/编号的单元格
+            name = ""
+            best_cn = 0
+            for c in cells:
+                cn = len(re.findall(r'[一-鿿]', c))
+                if cn >= 1 and not re.fullmatch(r'[\d/.\-]+', c) and cn > best_cn:
+                    name = c.strip()
+                    best_cn = cn
+            dates = extract_dates_from_text(row_text)
+            if not dates:
+                continue
+            oldest = min(dates)
+            days = (check_day - oldest).days
+            if days > 365:
+                label = "RoHS限用物质报告" if is_rohs else "材质证明/SGS报告"
+                kind = "RoHS" if is_rohs else "SGS"
+                msg = (f"{label}逐项过期：材料「{name or '未识别'}」报告日期 {oldest}，"
+                       f"距今 {days} 天 > 365 天（需重新提供）")
+                results["issues"].append(msg)
+                results["sub_items"][f"{kind}_逐项_{name or '未识别'}"] = f"❌ {msg}"
+                info = {"page": pg, "item": name or "未识别", "date": str(oldest), "days": days}
+                (results["expired_rohs"] if is_rohs else results["expired_sgs"]).append(info)
+
+    if results["expired_rohs"] or results["expired_sgs"]:
+        results["overall_status"] = "❌ 不合格"
     return results
 
 
@@ -2698,6 +3012,14 @@ def generate_final_verdict_v62(material_type, all_results, standards):
     if supplier_check.get("overall_status", "").startswith("❌") and supplier_check.get("issues"):
         issues.extend(supplier_check["issues"])
 
+    # V5.9.8: LCD显示模组专项检查结果（仅LCD物料启用）
+    lcd_bom = all_results.get("lcd_bom", {})
+    lcd_drawing = all_results.get("lcd_drawing", {})
+    if lcd_bom.get("overall_status", "").startswith("❌") and lcd_bom.get("issues"):
+        issues.extend(lcd_bom["issues"])
+    if lcd_drawing.get("overall_status", "").startswith("❌") and lcd_drawing.get("issues"):
+        issues.extend(lcd_drawing["issues"])
+
     total_fail = completeness.get("fail_count", 0)
     critical_fail = (
         completeness["status"] == "❌ 不合格"
@@ -2710,6 +3032,8 @@ def generate_final_verdict_v62(material_type, all_results, standards):
         or part_consistency.get("overall_status", "").startswith("❌")
         or (screw_check.get("is_screw") and screw_check.get("overall_status", "").startswith("❌"))  # V5.9.0
         or supplier_check.get("overall_status", "").startswith("❌")  # V5.9.2
+        or lcd_bom.get("overall_status", "").startswith("❌")  # V5.9.8
+        or lcd_drawing.get("overall_status", "").startswith("❌")  # V5.9.8
     )
 
     if critical_fail or len(issues) > 3:
@@ -2809,6 +3133,45 @@ def run_full_inspection(file_path, file_name, standards):
     # V5.9.2 新增：封面供应商信息完整性检查
     supplier_check = check_supplier_info_completeness(page_analysis, tables=tables)
 
+    # V5.9.8 新增：LCD显示模组专项检查 + 报告逐项时效性检查
+    is_lcd, lcd_kw = is_lcd_component(_cover_name, file_name, _mat_hint)
+    lcd_bom = {"overall_status": "⏭️ 不适用", "issues": [], "sub_items": {}}
+    lcd_drawing = {"overall_status": "⏭️ 不适用", "issues": [], "sub_items": {}}
+    per_item_expiry = (
+        check_per_item_report_expiry(page_analysis, tables, check_date)
+        if globals().get("peritem_check", True)
+        else {"overall_status": "⏭️ 未启用", "issues": [], "expired_rohs": [], "expired_sgs": [], "sub_items": {}}
+    )
+
+    if is_lcd:
+        if globals().get("lcd_check", True):
+            lcd_bom = check_lcd_bom_composition(page_analysis, tables)
+        if globals().get("lcd_drawing_check", True):
+            lcd_drawing = check_lcd_drawing_specs(page_analysis, file_path)
+
+    # 将逐项过期结果合并进 RoHS / 报告时效性（修复此前max日期遮罩旧报告bug）
+    if per_item_expiry["expired_rohs"]:
+        rohs["overall_status"] = "❌ 不合格"
+        for m in per_item_expiry["issues"]:
+            if "RoHS" in m and m not in rohs["issues"]:
+                rohs["issues"].append(m)
+        rohs["sub_items"]["2.5_RoHS逐项报告时效性"] = "❌ " + "；".join(
+            i["item"] + f"(报告日期{i['date']})" for i in per_item_expiry["expired_rohs"]
+        )
+        for k in ("2.2_RoHS调查表日期有效性", "2.4_RoHS测试报告日期有效性"):
+            if "✅" in rohs["sub_items"].get(k, ""):
+                rohs["sub_items"][k] = "❌ 过期（存在超期子项报告）"
+    if per_item_expiry["expired_sgs"]:
+        validity["overall_status"] = "❌ 不合格"
+        for m in per_item_expiry["issues"]:
+            if "SGS" in m and m not in validity["issues"]:
+                validity["issues"].append(m)
+        validity["sub_items"]["5.3_SGS逐项报告时效性"] = "❌ " + "；".join(
+            i["item"] + f"(报告日期{i['date']})" for i in per_item_expiry["expired_sgs"]
+        )
+        if "✅" in validity["sub_items"].get("5.1_RoHS报告时效性", ""):
+            validity["sub_items"]["5.1_RoHS报告时效性"] = "❌ 过期（SGS存在超期报告）"
+
     # V5.7 新增：根据料号识别物料类型（基于物料编码规则）
     _coding_rules = load_material_coding_rules()
     _mat_type_detail = mat_type_cn  # 默认使用原来的识别结果
@@ -2838,6 +3201,10 @@ def run_full_inspection(file_path, file_name, standards):
         "part_consistency": part_consistency,
         "screw_check": screw_check,  # V5.9.0
         "supplier_check": supplier_check,  # V5.9.2
+        # V5.9.8 新增
+        "lcd_bom": lcd_bom,
+        "lcd_drawing": lcd_drawing,
+        "per_item_expiry": per_item_expiry,
     }
     final = generate_final_verdict_v62(mat_type, all_results, standards)
 
@@ -2865,6 +3232,10 @@ def run_full_inspection(file_path, file_name, standards):
         "螺丝图纸要求": screw_check.get("overall_status", "⏭️ 不适用") if screw_check.get("is_screw") else "⏭️ 不适用",
         # V5.9.2 新增：封面供应商信息完整性
         "供应商信息": supplier_check.get("overall_status", "⏱ 未检测"),
+        # V5.9.8 新增
+        "LCD-BOM组成": lcd_bom["overall_status"],
+        "LCD-工程图规格": lcd_drawing["overall_status"],
+        "报告逐项时效": per_item_expiry["overall_status"],
         # 原有
         "总体结论": final["verdict"],
         "问题数量": final["issue_count"],
@@ -2898,6 +3269,10 @@ def run_full_inspection(file_path, file_name, standards):
             "part_consistency": part_consistency,
             "screw_check": screw_check,  # V5.9.0
             "supplier_check": supplier_check,  # V5.9.2
+            # V5.9.8 新增
+            "lcd_bom": lcd_bom,
+            "lcd_drawing": lcd_drawing,
+            "per_item_expiry": per_item_expiry,
             #
             "final": final,
         },
@@ -2966,6 +3341,10 @@ validity_check = st.sidebar.checkbox("✅ 报告时效性检验（≤1年）", v
 # V6.2 新增
 catalog_check = st.sidebar.checkbox("✅ 目录勾选状态检测（V6.2）", value=True)
 part_check = st.sidebar.checkbox("✅ 料号&物料名称跨表一致性（V6.2）", value=True)
+# V5.9.8 新增：LCD专项 + 报告逐项时效（自动按物料名称识别LCD，无需手动选）
+lcd_check = st.sidebar.checkbox("✅ LCD显示模组专项（BOM组成+工程图规格，自动识别）", value=True)
+lcd_drawing_check = st.sidebar.checkbox("✅ LCD工程图规格校验（DOL/4PB/色坐标/接地阻抗）", value=True)
+peritem_check = st.sidebar.checkbox("✅ 报告逐项时效性（逐项核对RoHS/SGS报告日期≤1年）", value=True)
 
 # ============================================================
 # V5.8 复位按钮
@@ -3350,6 +3729,26 @@ with col2:
                                 sc_df = pd.DataFrame(sc_rows)
                                 st.dataframe(sc_df, use_container_width=True, hide_index=True)
 
+                    # V5.9.8 新增：LCD显示模组专项检查
+                    if d.get("lcd_bom") or d.get("lcd_drawing"):
+                        lb = d.get("lcd_bom") or {}
+                        ld = d.get("lcd_drawing") or {}
+                        if isinstance(lb, dict) and lb.get("overall_status", "").startswith("⏭"):
+                            st.subheader("9️⃣ LCD显示模组专项检查（V5.9.8）")
+                            st.markdown("**整体判定:** ⏭️ 不适用（未识别为LCD显示模组物料）")
+                        else:
+                            st.subheader("9️⃣ LCD显示模组专项检查（V5.9.8）")
+                            if lb.get("overall_status"):
+                                st.markdown(f"**BOM组成完整性:** {lb.get('overall_status')}")
+                                if lb.get("sub_items"):
+                                    for k, v in lb["sub_items"].items():
+                                        st.text(f"{k}: {v}")
+                            if ld.get("overall_status"):
+                                st.markdown(f"**工程图规格校验:** {ld.get('overall_status')}")
+                                if ld.get("sub_items"):
+                                    for k, v in ld["sub_items"].items():
+                                        st.text(f"{k}: {v}")
+
                     # 最终处理建议
                     st.subheader("8️⃣ 检验结论与处理建议")
                     st.markdown(f"**{d['final']['verdict']}**")
@@ -3395,6 +3794,8 @@ with col2:
                         ("料号一致性", dd.get("part_consistency")),
                         ("螺丝图纸要求", dd.get("screw_check")),  # V5.9.0
                         ("供应商信息", dd.get("supplier_check")),  # V5.9.2
+                        ("LCD-BOM组成", dd.get("lcd_bom")),  # V5.9.8
+                        ("LCD-工程图规格", dd.get("lcd_drawing")),  # V5.9.8
                     ]
                     
                     for check_name, check_data in checks:
