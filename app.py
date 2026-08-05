@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.9
+封样检验Web应用 - V5.9.10
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -10,7 +10,7 @@ V5.3修复：KeyError崩溃防护、Excel错误汇总sheet、大文件稳定性�
 V5.9.5优化：使用pypdfium2预提取文本，170页大PDF审核从90秒降至4秒
 V5.9.8新增：LCD显示模组专项检查（BOM组成完整性、工程图DOL≥40/4PB≥600/色坐标/接地阻抗规格）；报告逐项时效性检查（逐行核对RoHS/SGS报告日期≤365天，修复max日期遮罩旧报告bug）
 V5.9.7修复：文件名料号使用词边界避免误提取厂商编码（如LMIWH055121571）；封面Product name长名称物料名称提取；BOM组成部件不参与物料名称对比
-V5.9.9修复：QCP（Quality Control Plan）识别为CPK等价文档，解决QCP页面CPK显示缺失；RoHS/REACH测试报告检测增加中文匹配兜底（避免all_text截断导致英文关键词丢失）；表格提取范围扩展至35页覆盖后置管控文档
+V5.9.10修复：RoHS/REACH报告条件性检查（根据封面"物料环保要求"勾选状态：必须符合则要求提供，不需要符合则跳过并标注；未检测到时默认要求提供并提示）；QCP识别为CPK等价（V5.9.9）；文件名料号词边界排除厂商编码（V5.9.7）；Product name长名称提取（V5.9.7）
 """
 
 import streamlit as st
@@ -1139,9 +1139,10 @@ def determine_material_type(file_name, standards, pdf_content_hint=None):
     return "unknown", "未知类型", None, False
 
 
-def inspect_file_completeness_v4(page_analysis, material_type, standards):
+def inspect_file_completeness_v4(page_analysis, material_type, standards, env_requirements=None):
     """
     V4.0 第一类：文件完整性检验（基于逐页分析结果）
+    V5.9.10: 新增 env_requirements 参数，支持根据封面 RoHS/REACH 勾选状态条件性检查
     返回: dict with item-level results and overall status
     """
     results = {
@@ -1210,40 +1211,71 @@ def inspect_file_completeness_v4(page_analysis, material_type, standards):
         elif "材质证明" in name or "Material Certificate" in english:
             found = "材质证明" in all_text or "material certificate" in all_text or "sgs" in all_text
         elif "RoHS" in name and "调查表" in name:
-            found = has_rohs
+            # V5.9.10: 条件性检查 — 封面不要求则跳过
+            if env_requirements is not None and env_requirements.get("rohs_required") == False:
+                found = True  # 视为通过（不要求）
+                item_note = "⏱ 封面RoHS标记为'不需要符合'，此项不强制"
+            else:
+                found = has_rohs
+                if env_requirements is not None and env_requirements.get("rohs_required") is None:
+                    item_note = "⚠️ 封面环保要求未明确检测到，默认要求提供"
         elif "RoHS" in name and ("测试报告" in name or "独立报告" in name):
-            # V5.9.9: 中英文双重匹配，避免 all_text 截断导致英文关键词丢失
-            found = (
-                ("rohs" in all_text and "test report" in all_text) or
-                ("rohs" in all_text and "测试报告" in all_text) or
-                has_rohs
-            )
+            # V5.9.9: 中英文双重匹配 + V5.9.10: 条件性检查
+            if env_requirements is not None and env_requirements.get("rohs_required") == False:
+                found = True
+                item_note = "⏱ 封面RoHS标记为'不需要符合'，此项不强制"
+            else:
+                found = (
+                    ("rohs" in all_text and "test report" in all_text) or
+                    ("rohs" in all_text and "测试报告" in all_text) or
+                    has_rohs
+                )
+                if env_requirements is not None and env_requirements.get("rohs_required") is None:
+                    item_note = "⚠️ 封面环保要求未明确检测到，默认要求提供"
         elif "REACH" in name and "调查表" in name:
-            # V5.9.9: 放宽 REACH 调查表检测（部分 PDF 用中文标题如 REACH物质成分调查表）
-            found = has_reach or (
-                "reach" in all_text and ("调查表" in all_text or "survey" in all_text or
-                 "物质成分" in all_text or "svhc" in all_text)
-            )
+            # V5.9.10: 条件性检查
+            if env_requirements is not None and env_requirements.get("reach_required") == False:
+                found = True
+                item_note = "⏱ 封面REACH标记为'不需要符合'，此项不强制"
+            else:
+                found = has_reach or (
+                    "reach" in all_text and ("调查表" in all_text or "survey" in all_text or
+                     "物质成分" in all_text or "svhc" in all_text)
+                )
+                if env_requirements is not None and env_requirements.get("reach_required") is None:
+                    item_note = "⚠️ 封面环保要求未明确检测到，默认要求提供"
         elif "REACH" in name and ("测试报告" in name or "独立报告" in name):
-            # V5.9.9: 中英文双重匹配
-            found = (
-                ("reach" in all_text and "test report" in all_text) or
-                ("reach" in all_text and "测试报告" in all_text)
-            )
+            # V5.9.10: 条件性检查
+            if env_requirements is not None and env_requirements.get("reach_required") == False:
+                found = True
+                item_note = "⏱ 封面REACH标记为'不需要符合'，此项不强制"
+            else:
+                found = (
+                    ("reach" in all_text and "test report" in all_text) or
+                    ("reach" in all_text and "测试报告" in all_text)
+                )
+                if env_requirements is not None and env_requirements.get("reach_required") is None:
+                    item_note = "⚠️ 封面环保要求未明确检测到，默认要求提供"
         else:
             # 通用关键词匹配
             fnd, _ = check_keyword_in_text(all_text, [name, english])
             found = fnd
 
+        # V5.9.10: 区分"不需要符合"与"已找到"
+        _is_not_required = str(item_note).startswith("⏱") if item_note else False
+
         item_result = {
             "序号": item["id"],
             "项目": f"{name} ({english})",
             "必填": "✅" if required is True else ("⚠️" if required == "conditional" else "❌"),
-            "结果": "✅ 已找到" if found else "❌ 缺失",
+            "结果": (
+                "⏱ 不需要（封面未要求）" if _is_not_required
+                else ("✅ 已找到" if found else "❌ 缺失")
+            ),
             "备注": item_note,
         }
 
-        if found:
+        if found or _is_not_required:
             results["pass_count"] += 1
         else:
             results["fail_count"] += 1
@@ -2156,6 +2188,118 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
         if (_pn_clean in _label_only_words or
                 len(re.findall(r'\d', _pn)) < 4):
             result["part_number"] = ""
+
+    return result
+
+
+def extract_env_requirements(page_analysis, tables=None):
+    """
+    V5.9.10: 从封面/样品承认书提取 RoHS / REACH 环保要求勾选状态。
+    部分PDF的"物料环保要求"行为表单控件或图片层，文本引擎可能无法提取。
+    
+    返回: {
+        "rohs_required": bool | None,  # True=必须符合, False=不需要, None=未检测到
+        "reach_required": bool | None,
+        "source": str,  # "text" | "table" | "not_detected"
+        "raw_text": str,  # 检测到的原始文本（用于调试）
+    }
+    """
+    result = {
+        "rohs_required": None,   # 默认 None = 未检测到
+        "reach_required": None,
+        "source": "not_detected",
+        "raw_text": "",
+    }
+
+    # --- 策略1：从封面纯文本中搜索 ---
+    cover_texts = []
+    for p in page_analysis:
+        if p.get("is_cover"):
+            cover_texts.append(p.get("text", ""))
+    # 也检查前3页（有些PDF封面信息延续到第2页）
+    for p in page_analysis[:3]:
+        if p.get("text") and p not in [x for x in page_analysis if x.get("is_cover")]:
+            cover_texts.append(p.get("text", ""))
+
+    combined_text = "\n".join(cover_texts)
+    result["raw_text"] = combined_text[:500]  # 保存用于调试
+
+    if combined_text:
+        ct_lower = combined_text.lower()
+
+        # 检测 RoHS 要求
+        rohs_must = re.search(
+            r'rohs\s*2\.0.*?(?:必须符合|must\s*meet|☑|✓|checked)',
+            combined_text, re.IGNORECASE | re.DOTALL
+        )
+        rohs_not = re.search(
+            r'rohs\s*2\.0.*?(?:不需要符合|not\s*required|□|unchecked)',
+            combined_text, re.IGNORECASE | re.DOTALL
+        )
+        # 宽泛检测：同一区域出现 rohs + "必须/not"
+        if not rohs_must and not rohs_not:
+            if re.search(r'rohs.*(?:必须|must)', ct_lower):
+                rohs_must = True
+            elif re.search(r'rohs.*(?:不需要|not\s*req)', ct_lower):
+                rohs_not = True
+
+        if rohs_must and not rohs_not:
+            result["rohs_required"] = True
+            result["source"] = "text"
+        elif rohs_not and not rohs_must:
+            result["rohs_required"] = False
+            result["source"] = "text"
+
+        # 检测 REACH 要求
+        reach_must = re.search(
+            r'reach(?:\s*(?:法规|regulation))?.*?(?:必须符合|must\s*meet|☑|✓|checked)',
+            combined_text, re.IGNORECASE | re.DOTALL
+        )
+        reach_not = re.search(
+            r'reach(?:\s*(?:法规|regulation))?.*?(?:不需要符合|not\s*required|□|unchecked)',
+            combined_text, re.IGNORECASE | re.DOTALL
+        )
+        if not reach_must and not reach_not:
+            if re.search(r'reach.*(?:必须|must)', ct_lower):
+                reach_must = True
+            elif re.search(r'reach.*(?:不需要|not\s*req)', ct_lower):
+                reach_not = True
+
+        if reach_must and not reach_not:
+            result["reach_required"] = True
+            if result["source"] == "text":
+                pass  # already set
+            else:
+                result["source"] = "text"
+        elif reach_not and not reach_must:
+            result["reach_required"] = False
+            if result["source"] == "not_detected":
+                result["source"] = "text"
+
+    # --- 策略2：从封面表格中搜索 ---
+    if tables and result["rohs_required"] is None:
+        for t_dict in tables:
+            tbl_page = t_dict.get("page", 0)
+            if tbl_page > 2:
+                continue  # 只看前3页的表格（封面区域）
+            tbl = t_dict.get("table", [])
+            for row in tbl:
+                row_str = " ".join(str(c) if c else "" for c in row).lower()
+                if "environmental" in row_str or "环保要求" in row_str or ("rohs" in row_str and "reach" in row_str):
+                    result["raw_text"] += f" | TABLE_ROW: {row_str}"
+                    # 在该行或相邻行找 Must meet / Not required
+                    if re.search(r'must\s*meet|必须符合|☑', row_str):
+                        if "rohs" in row_str:
+                            result["rohs_required"] = True
+                        if "reach" in row_str:
+                            result["reach_required"] = True
+                        result["source"] = "table"
+                    elif re.search(r'not\s*required|不需要符合|□', row_str):
+                        if "rohs" in row_str:
+                            result["rohs_required"] = False
+                        if "reach" in row_str:
+                            result["reach_required"] = False
+                        result["source"] = "table"
 
     return result
 
@@ -3116,7 +3260,9 @@ def run_full_inspection(file_path, file_name, standards):
     file_type, file_type_note = check_file_type(file_path, all_text)
 
     # 第二步~第五步：各类检验（基于逐页分析结果）
-    completeness = inspect_file_completeness_v4(page_analysis, mat_type, standards)
+    # V5.9.10: 先提取封面环保要求（RoHS/REACH勾选状态）
+    env_req = extract_env_requirements(page_analysis, tables=tables)
+    completeness = inspect_file_completeness_v4(page_analysis, mat_type, standards, env_requirements=env_req)
     rohs = inspect_rohs_compliance(page_analysis, standards, check_date, tables=tables)
     cpk = inspect_cpk_compliance(page_analysis, standards, all_text, tables=tables)
     dimension = inspect_dimension_correspondence(page_analysis, standards)
@@ -3205,6 +3351,7 @@ def run_full_inspection(file_path, file_name, standards):
         "lcd_bom": lcd_bom,
         "lcd_drawing": lcd_drawing,
         "per_item_expiry": per_item_expiry,
+        "env_requirements": env_req,  # V5.9.10: 封面RoHS/REACH勾选状态
     }
     final = generate_final_verdict_v62(mat_type, all_results, standards)
 
@@ -3273,6 +3420,7 @@ def run_full_inspection(file_path, file_name, standards):
             "lcd_bom": lcd_bom,
             "lcd_drawing": lcd_drawing,
             "per_item_expiry": per_item_expiry,
+            "env_requirements": env_req,  # V5.9.10
             #
             "final": final,
         },
@@ -3745,9 +3893,33 @@ with col2:
                                         st.text(f"{k}: {v}")
                             if ld.get("overall_status"):
                                 st.markdown(f"**工程图规格校验:** {ld.get('overall_status')}")
-                                if ld.get("sub_items"):
-                                    for k, v in ld["sub_items"].items():
-                                        st.text(f"{k}: {v}")
+                            if ld.get("sub_items"):
+                                for k, v in ld["sub_items"].items():
+                                    st.text(f"{k}: {v}")
+
+                    # V5.9.10: 显示封面环保要求状态
+                    er = dd.get("env_requirements", {})
+                    if er:
+                        st.subheader("🔰 封面环保要求（V5.9.10）")
+                        rohs_st = er.get("rohs_required")
+                        reach_st = er.get("reach_required")
+                        src = er.get("source", "not_detected")
+                        if rohs_st is True:
+                            st.markdown("**RoHS 2.0:** ☑ 必须符合（需提供报告）")
+                        elif rohs_st is False:
+                            st.markdown("**RoHS 2.0:** □ 不需要符合（免提供）")
+                        else:
+                            st.markdown("**RoHS 2.0:** ⚠️ 未检测到（默认要求提供）")
+
+                        if reach_st is True:
+                            st.markdown("**REACH 法规:** ☑ 必须符合（需提供报告）")
+                        elif reach_st is False:
+                            st.markdown("**REACH 法规:** □ 不需要符合（免提供）")
+                        else:
+                            st.markdown("**REACH 法规:** ⚠️ 未检测到（默认要求提供）")
+
+                        if src == "not_detected":
+                            st.caption("💡 提示：部分PDF的环保要求为表单控件，文本引擎可能无法读取。如实际封面已勾选'不需要符合'，可忽略相关缺失项。")
 
                     # 最终处理建议
                     st.subheader("8️⃣ 检验结论与处理建议")
@@ -3796,6 +3968,7 @@ with col2:
                         ("供应商信息", dd.get("supplier_check")),  # V5.9.2
                         ("LCD-BOM组成", dd.get("lcd_bom")),  # V5.9.8
                         ("LCD-工程图规格", dd.get("lcd_drawing")),  # V5.9.8
+                        ("环保要求状态", dd.get("env_requirements")),  # V5.9.10
                     ]
                     
                     for check_name, check_data in checks:
