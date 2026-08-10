@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.10
+封样检验Web应用 - V5.9.12
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -11,6 +11,7 @@ V5.9.5优化：使用pypdfium2预提取文本，170页大PDF审核从90秒降至
 V5.9.8新增：LCD显示模组专项检查（BOM组成完整性、工程图DOL≥40/4PB≥600/色坐标/接地阻抗规格）；报告逐项时效性检查（逐行核对RoHS/SGS报告日期≤365天，修复max日期遮罩旧报告bug）
 V5.9.7修复：文件名料号使用词边界避免误提取厂商编码（如LMIWH055121571）；封面Product name长名称物料名称提取；BOM组成部件不参与物料名称对比
 V5.9.10修复：RoHS/REACH报告条件性检查（根据封面"物料环保要求"勾选状态：必须符合则要求提供，不需要符合则跳过并标注；未检测到时默认要求提供并提示）；QCP识别为CPK等价（V5.9.9）；文件名料号词边界排除厂商编码（V5.9.7）；Product name长名称提取（V5.9.7）
+V5.9.11修复：UI渲染NameError崩溃（dd->d变量名笔误）；V5.9.12新增：供应商签名/盖章（SI-6）必填检查——封面「Supplier signature (with company seal)」Signature栏位不能为空，必须有签名或盖章
 """
 
 import streamlit as st
@@ -515,7 +516,8 @@ def check_supplier_info_completeness(page_analysis, tables=None):
       SI-2 供应商地址（Supplier address）— 必须填写
       SI-3 联系方式（Supplier contact）— 必须填写真实信息，不能仅为占位符(XXX)
       SI-4 收件人邮箱（Recipient email）— 必须填写
-    
+      SI-6 供应商签名/盖章（Supplier signature with seal）— 必须有签名或盖章，不能为空（V5.9.12）
+
     参考字段（不影响合格判定，仅作提示）：
       SI-5 部门签署（Department Signatures）— Produced/Engineering/Design/Quality + 签名+日期
     
@@ -813,8 +815,94 @@ def check_supplier_info_completeness(page_analysis, tables=None):
         si5["detail"] = "未检测到部门签署信息（此项为参考项）"
     result["checks"].append(si5)
 
+    # === SI-6: 供应商签名/盖章（必填，V5.9.12）===
+    # 检查 "Supplier signature (with company seal)" / "供应商签名（带公司章）" 区域的 Signature 栏位
+    # 必须有签名或盖章，不能为空
+    si6 = {"id": "SI-6", "name": "供应商签名/盖章(Supplier signature with seal)", "status": "", "detail": ""}
+    sig_seal_keywords = [
+        "supplier signature", "supplier sign", "供应商签名", "供应商签章",
+        "signature (with company seal)", "signature with",
+        "签名(带公司章)", "签名（带公司章）", "带公司章",
+    ]
+
+    # 在封面表格中定位"供应商签名"行，检查 Signature 列是否有内容
+    _sig_cell_has_content = False
+    _sig_detail = ""
+    for tbl in cover_tables:
+        for row_idx, row in enumerate(tbl):
+            if not row:
+                continue
+            # 查找包含签名关键词的行
+            row_text = " ".join(str(c or "").strip() for c in row if c)
+            row_text_lower = row_text.lower()
+            if any(kw in row_text_lower for kw in sig_seal_keywords):
+                # 在该行或相邻行中查找 Signature 对应的值单元格
+                for col_idx, cell in enumerate(row):
+                    if cell is None:
+                        continue
+                    cs = str(cell).strip()
+                    cs_lower = cs.lower()
+                    # 找到 Signature 标签列，取同行右侧或下方单元格的值
+                    if any(kw in cs_lower for kw in ["signature", "签名", "sign"]):
+                        # 取右侧紧邻单元格
+                        if col_idx + 1 < len(row) and row[col_idx + 1] is not None:
+                            val = str(row[col_idx + 1]).strip()
+                            if val and not _is_placeholder(val) and not _looks_like_label(val):
+                                _sig_cell_has_content = True
+                                _sig_detail = f"检测到内容: {val[:40]}"
+                                break
+                        # 取正下方同列单元格
+                        if not _sig_cell_has_content and row_idx + 1 < len(tbl):
+                            next_row = tbl[row_idx + 1]
+                            if col_idx < len(next_row) and next_row[col_idx] is not None:
+                                val = str(next_row[col_idx]).strip()
+                                if val and not _is_placeholder(val) and not _looks_like_label(val):
+                                    _sig_cell_has_content = True
+                                    _sig_detail = f"检测到内容: {val[:40]}"
+                                    break
+                    # 也直接检查该行非标签单元格是否有实质内容（日期/姓名/图章文字）
+                    if not _sig_cell_has_content and cs and not _looks_like_label(cs):
+                        # 日期格式、中文姓名长度2-6字、或常见图章文字
+                        if (re.search(r'\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}', cs) or
+                            (2 <= len(cs) <= 8 and re.search(r'[\u4e00-\u9fff]{2,}', cs)) or
+                            re.search(r'(seal|stamp|章|印|approved|核准)', cs_lower)):
+                            _sig_cell_has_content = True
+                            _sig_detail = f"检测到签名/盖章痕迹: {cs[:40]}"
+                            break
+            if _sig_cell_has_content:
+                break
+        if _sig_cell_has_content:
+            break
+
+    # 兜底：在整个封面文本+表格区域搜索签名相关内容
+    if not _sig_cell_has_content:
+        # 检查是否有日期格式出现在签名区域附近（说明有人签署过）
+        _sig_area_text = ""
+        for tbl in cover_tables:
+            for row in tbl:
+                rt = " ".join(str(c or "") for c in row if c)
+                if any(kw in rt.lower() for kw in sig_seal_keywords):
+                    _sig_area_text += rt + " "
+        if _sig_area_text:
+            # 签名区域存在但可能为手写体/图片印章（文本提取不到）
+            if re.search(r'\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}', _sig_area_text):
+                _sig_cell_has_content = True
+                _sig_detail = "检测到签署日期（签名/盖章可能为手写体或图片形式，需人工确认）"
+
+    if _sig_cell_has_content:
+        si6["status"] = "✅ 已签名/已盖章"
+        si6["detail"] = _sig_detail
+    else:
+        si6["status"] = "❌ 缺失"
+        si6["detail"] = "「供应商签名(带公司章)」区域的Signature栏位为空，必须有签名或盖章"
+        result["issues"].append("[SI-6] 供应商签名/盖章缺失 — 封面「Supplier signature (with company seal)」Signature栏位为空，需签名或加盖公章")
+    result["checks"].append(si6)
+
     # === 整体状态判定 ===
     required_fails = sum(1 for c in result["checks"][:4] if c["status"].startswith("❌"))
+    # V5.9.12: SI-6 也计入必填失败
+    if result["checks"] and len(result["checks"]) >= 6:
+        required_fails += sum(1 for c in [result["checks"][5]] if c["status"].startswith("❌"))
     if required_fails >= 3:
         result["overall_status"] = "❌ 不合格（供应商信息严重缺失）"
     elif required_fails >= 1:
