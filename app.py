@@ -3898,7 +3898,7 @@ with col2:
                                     st.text(f"{k}: {v}")
 
                     # V5.9.10: 显示封面环保要求状态
-                    er = dd.get("env_requirements", {})
+                    er = d.get("env_requirements", {})
                     if er:
                         st.subheader("🔰 封面环保要求（V5.9.10）")
                         rohs_st = er.get("rohs_required")
