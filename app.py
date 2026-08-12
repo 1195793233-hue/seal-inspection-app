@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.12
+封样检验Web应用 - V5.9.13
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -12,6 +12,7 @@ V5.9.8新增：LCD显示模组专项检查（BOM组成完整性、工程图DOL�
 V5.9.7修复：文件名料号使用词边界避免误提取厂商编码（如LMIWH055121571）；封面Product name长名称物料名称提取；BOM组成部件不参与物料名称对比
 V5.9.10修复：RoHS/REACH报告条件性检查（根据封面"物料环保要求"勾选状态：必须符合则要求提供，不需要符合则跳过并标注；未检测到时默认要求提供并提示）；QCP识别为CPK等价（V5.9.9）；文件名料号词边界排除厂商编码（V5.9.7）；Product name长名称提取（V5.9.7）
 V5.9.11修复：UI渲染NameError崩溃（dd->d变量名笔误）；V5.9.12新增：供应商签名/盖章（SI-6）必填检查——封面「Supplier signature (with company seal)」Signature栏位不能为空，必须有签名或盖章
+V5.9.13修复：LCD识别关键词过宽导致背胶/泡棉等非LCD物料误触发LCD专项检查——增加排除词（背胶/泡棉/胶带/海绵等14项）；LCD核心词仅匹配物料名/文件名；全文辅助需≥3个弱信号才触发
 """
 
 import streamlit as st
@@ -1700,22 +1701,69 @@ def is_lcd_component(material_name="", file_name="", content_hint=""):
     V5.9.8: 根据物料名称/文件名/内容关键词判定是否为LCD显示模组类物料。
     用于决定是否启用 LCD 专属检查（BOM组成、工程图规格）。
     返回: (bool, matched_keyword)
+
+    V5.9.12修复：收紧LCD识别关键词，避免背胶/泡棉/胶带等非LCD物料误触发。
+      - 仅在物料名称或文件名中匹配核心LCD关键词；
+      - 全文(content_hint)仅用作辅助确认，不单独触发；
+      - 增加排除词列表，明确非LCD物料直接返回False。
     """
-    lcd_keywords = [
-        "touch panel", "display", "lcd", "tft", "oled", "module", "monitor",
-        "触摸屏", "触控", "显示模组", "液晶", "模组", "主屏", "屏",
+    # === 排除词：包含任一即确定不是LCD ===
+    exclude_keywords = [
+        "背胶", "双面胶", "单面胶", "胶带", "泡棉", "海绵", "泡沫",
+        "adhesive", "tape", "foam", "sponge", "sticker",
+        "绝缘片", "绝缘纸", "麦拉", "mylar",
+        "垫片", "spacer", "gasket", "washer",
+        "保护膜", "pet膜", "release film",
     ]
-    texts = []
-    if material_name:
-        texts.append(material_name.lower())
-    if file_name:
-        texts.append(file_name.lower())
-    if content_hint:
-        texts.append(content_hint.lower())
-    combined = " ".join(texts)
-    for kw in lcd_keywords:
-        if kw in combined:
+    # 在物料名称和文件名中检查排除词（优先级最高）
+    name_text = (material_name + " " + file_name).lower()
+    for ek in exclude_keywords:
+        if ek in name_text:
+            return False, f"excluded:{ek}"
+
+    # === LCD核心关键词（仅在物料名/文件名中匹配，避免全文误触）===
+    lcd_name_keywords = [
+        "触摸屏", "touch panel", "触控屏",
+        "显示模组", "display module", "lcd模组",
+        "液晶模组", "液晶屏",
+        "tft模组", "tft屏",
+        "oled模组", "oled屏",
+        "主显示屏", "主显示", "液晶显示",
+        "lcd屏", "tft lcd",
+    ]
+
+    # === LCD辅助关键词（需配合核心词或在物料名中独立出现）===
+    lcd_aux_keywords = [
+        "lcd模块", "lcd组件",
+        "背光模组", "背光板",
+        "cg盖板", "cover glass",
+        "fpc软板", "fpc排线",
+    ]
+
+    # 1️⃣ 首先检查物料名称/文件名中的核心关键词（最可靠）
+    search_name = material_name.lower() + " " + file_name.lower()
+    for kw in lcd_name_keywords:
+        if kw in search_name:
             return True, kw
+
+    # 2️⃣ 检查辅助关键词（仅限物料名/文件名）
+    for kw in lcd_aux_keywords:
+        if kw in search_name:
+            return True, kw
+
+    # 3️⃣ 兜底：全文辅助确认（仅当物料名已含弱LCD信号时才启用）
+    #     要求同时出现至少2个LCD相关词，降低误判率
+    weak_lcd_signals = ["lcd", "tft", "oled", "触摸", "显示", "模组", "背光", "色坐标"]
+    if content_hint:
+        hint_lower = content_hint.lower()
+        weak_count = sum(1 for s in weak_lcd_signals if s in hint_lower)
+        # 全文中有≥3个弱信号且物料名/文件名不含排除词 → 可能是LCD
+        if weak_count >= 3:
+            # 再做一次确认：物料名中是否有任何显示相关词
+            confirm_words = ["显示", "屏", "lcd", "tft", "oled"]
+            if any(cw in search_name for cw in confirm_words):
+                return True, f"hint_combined(weak={weak_count})"
+
     return False, None
 
 
