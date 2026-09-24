@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.13
+封样检验Web应用 - V5.9.14
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -13,6 +13,7 @@ V5.9.7修复：文件名料号使用词边界避免误提取厂商编码（如LM
 V5.9.10修复：RoHS/REACH报告条件性检查（根据封面"物料环保要求"勾选状态：必须符合则要求提供，不需要符合则跳过并标注；未检测到时默认要求提供并提示）；QCP识别为CPK等价（V5.9.9）；文件名料号词边界排除厂商编码（V5.9.7）；Product name长名称提取（V5.9.7）
 V5.9.11修复：UI渲染NameError崩溃（dd->d变量名笔误）；V5.9.12新增：供应商签名/盖章（SI-6）必填检查——封面「Supplier signature (with company seal)」Signature栏位不能为空，必须有签名或盖章
 V5.9.13修复：LCD识别关键词过宽导致背胶/泡棉等非LCD物料误触发LCD专项检查——增加排除词（背胶/泡棉/胶带/海绵等14项）；LCD核心词仅匹配物料名/文件名；全文辅助需≥3个弱信号才触发
+V5.9.14新增：①附件形式报告检测（SGS/RoHS/REACH以.7z等压缩包提供时提醒无法核对内容，并跳过该页逐项日期判定，修复REACH调查表被误判为SGS导致SGS超期误报）；②全尺寸测量报告/CPK报告表头料号(Part Number)栏空白校验
 """
 
 import streamlit as st
@@ -1937,6 +1938,252 @@ def check_lcd_drawing_specs(page_analysis, pdf_path=None):
     return results
 
 
+# ============================================================
+# V5.9.14 新增：附件形式报告检测 + 测量报告料号栏校验
+# ============================================================
+
+# 附件压缩包扩展名（检测报告被单独打包成附件的情形）
+_ATTACH_EXTS = (".7z", ".zip", ".rar", ".tar", ".gz", ".tgz")
+_ATTACH_EXT_RE = re.compile(
+    r'([0-9A-Za-z\u4e00-\u9fff][0-9A-Za-z\u4e00-\u9fff（）()_\-\s]{2,60}?'
+    r'\.(?:7z|zip|rar|tar|gz|tgz|7Z|ZIP|RAR))\b'
+)
+
+
+def _extract_attachment_filenames(text):
+    """从文本中提取附件压缩包文件名（如 CXC5A6237-V1（（K461...）MSDS.7z）"""
+    found = []
+    if not text:
+        return found
+    lower = text.lower()
+    if not any(ext in lower for ext in _ATTACH_EXTS):
+        return found
+    # 优先：按空白/换行切分，取以附件扩展名结尾的整段（文件名一般不含空格）
+    tokens = [t for t in re.split(r'[\s\u3000]+', text.strip()) if t]
+    for t in tokens:
+        if len(t) >= 6 and t.lower().endswith(_ATTACH_EXTS):
+            found.append(t)
+    if found:
+        return found
+    # 兜底：正则贪心匹配后取最后一段，避免带入前文碎片
+    for m in _ATTACH_EXT_RE.finditer(text):
+        name = m.group(1).strip()
+        parts = [x for x in re.split(r'[\s\u3000]+', name) if x]
+        if parts:
+            name = parts[-1]
+            if len(name) < 8 and len(parts) >= 2:
+                name = parts[-2] + " " + name
+        if len(name) >= 6:
+            found.append(name)
+    return found
+
+
+def detect_report_attachments(page_analysis, tables=None):
+    """
+    V5.9.14: 检测检测报告以「附件压缩包」形式提供的情况。
+    当 SGS/材质证明、RoHS 2.0、REACH 等报告页仅给出 .7z/.zip 等附件、
+    而没有把报告正文合并进承认书时，无法核对报告内容与报告日期，
+    需要提醒人工确认或要求供应商提供报告原件。
+
+    返回: {
+        "overall_status": "⚠️ 需人工确认" | "✅ 未发现附件",
+        "issues": [...], "sub_items": {...},
+        "items": [{"page", "type", "filename"}],
+        "attachment_pages": set(),
+    }
+    """
+    result = {
+        "overall_status": "✅ 未发现附件",
+        "issues": [],
+        "sub_items": {},
+        "items": [],
+        "attachment_pages": set(),
+    }
+    if not page_analysis:
+        return result
+
+    for p in page_analysis:
+        pg = p.get("page_num")
+        txt = p.get("text") or ""
+        names = _extract_attachment_filenames(txt)
+        # 表格单元格兜底
+        if not names and tables:
+            for t in tables:
+                if t.get("page") != pg:
+                    continue
+                for row in (t.get("table") or []):
+                    for cell in (row or []):
+                        if cell:
+                            names.extend(_extract_attachment_filenames(str(cell)))
+        if not names:
+            continue
+
+        tl = txt.lower()
+        if "reach" in tl:
+            rtype = "REACH测试报告"
+        elif "rohs" in tl:
+            rtype = "RoHS 2.0测试报告"
+        elif ("材质证明" in txt) or ("sgs" in tl) or ("msds" in tl):
+            rtype = "材质证明/SGS报告"
+        else:
+            rtype = "检测报告"
+
+        for nm in dict.fromkeys(names):
+            item = {"page": pg, "type": rtype, "filename": nm}
+            if item not in result["items"]:
+                result["items"].append(item)
+        result["attachment_pages"].add(pg)
+
+    if result["items"]:
+        result["overall_status"] = "⚠️ 需人工确认"
+        for it in result["items"]:
+            msg = (f"{it['type']}以附件形式提供（第{it['page']}页：{it['filename']}），"
+                   f"报告正文未合并进承认书，无法核对报告内容与报告日期，"
+                   f"请人工确认或要求供应商提供报告原件")
+            result["issues"].append(msg)
+            result["sub_items"][f"{it['type']}_P{it['page']}"] = f"⚠️ 附件形式：{it['filename']}"
+        if any("RoHS" in it["type"] for it in result["items"]):
+            result["issues"].append(
+                "RoHS 2.0测试报告：模板明确要求「测试报告不可作为附档插入，"
+                "需将所有组成物料的PDF测试报告展开合并进承认书」，请供应商重新提供合并版"
+            )
+    return result
+
+
+# --- 料号栏(Part Number)校验辅助 ---
+_PN_LABEL_RE = re.compile(r'(part\s*(?:number|no\.?)|料号)', re.I)
+_PN_VALUE_RE = re.compile(r'[A-Za-z]{1,2}\d{6,}[A-Za-z]{0,3}')
+_PN_LABEL_HINTS = [
+    "vendor", "供应商", "tool number", "模号", "cav", "穴数", "unit", "单位",
+    "material", "材质", "description", "零件名称", "inspected", "确认者",
+    "revision", "版本", "date", "日期", "part number", "料号", "part name",
+    "part no", "inches", "millimeters", "comments", "设计者", "signature", "签名",
+]
+
+
+def _cell_is_blank_or_label(cell):
+    """True = 该单元格为空或仅是字段标签（即不是填写值）"""
+    if cell is None:
+        return True
+    v = str(cell).strip()
+    if not v:
+        return True
+    if _PN_VALUE_RE.search(v):
+        return False  # 明确是料号值
+    vl = v.lower()
+    if any(h in vl for h in _PN_LABEL_HINTS):
+        return True   # 是字段标签
+    if v in ("-", "—", "/", "\\", "N/A", "NA", "无", "待定", "TBD"):
+        return True
+    return False
+
+
+def _find_pn_field_in_page(pg, tables):
+    """在指定页表格中查找 Part Number 标签及对应值单元格。
+    返回 (found_label, filled, value)"""
+    for t_dict in tables:
+        if t_dict.get("page") != pg:
+            continue
+        tbl = t_dict.get("table") or []
+        for r_idx, row in enumerate(tbl):
+            if not row:
+                continue
+            for c_idx, cell in enumerate(row):
+                if cell is None:
+                    continue
+                cs = str(cell)
+                if not _PN_LABEL_RE.search(cs):
+                    continue
+                # 排除 BOM 的 "Part material number"
+                if "material" in cs.lower():
+                    continue
+                cands = []
+                if c_idx + 1 < len(row):
+                    cands.append(row[c_idx + 1])
+                if c_idx + 2 < len(row):
+                    cands.append(row[c_idx + 2])
+                if r_idx + 1 < len(tbl):
+                    nxt = tbl[r_idx + 1]
+                    if c_idx < len(nxt):
+                        cands.append(nxt[c_idx])
+                    if c_idx + 1 < len(nxt):
+                        cands.append(nxt[c_idx + 1])
+                vals = [str(c).strip() for c in cands
+                        if c is not None and not _cell_is_blank_or_label(c)]
+                if vals:
+                    return True, True, vals[0]
+                return True, False, ""
+    return False, False, ""
+
+
+def check_report_pn_fields(page_analysis, tables=None, cover_pn=""):
+    """
+    V5.9.14: 校验「全尺寸测量报告」与「CPK报告」表头的料号(Part Number)栏是否填写。
+    模板要求这两张报告表头必须填写内部料号，空白则视为缺失。
+
+    返回: {"overall_status", "issues", "sub_items", "items"}
+    """
+    result = {"overall_status": "✅ 通过", "issues": [], "sub_items": {}, "items": []}
+    if not tables or not page_analysis:
+        result["overall_status"] = "⏱ 无法检测"
+        result["issues"].append("[测量报告料号] 未提取到表格数据，无法校验料号栏")
+        return result
+
+    targets = [
+        ("全尺寸测量报告", ["full size measurement report", "全尺寸测量报告"]),
+        ("CPK报告", ["cpk report", "cpk 报告", "cpk报告"]),
+    ]
+
+    for label, kws in targets:
+        pages = []
+        for p in page_analysis:
+            t = (p.get("text") or "").lower()
+            if any(k in t for k in kws):
+                pages.append(p.get("page_num"))
+        if not pages:
+            result["sub_items"][label] = "⏱ 未找到该报告页"
+            continue
+
+        found_label = False
+        filled = False
+        value = ""
+        for pg in pages:
+            f_lbl, f_filled, v = _find_pn_field_in_page(pg, tables)
+            if f_lbl:
+                found_label, filled, value = True, f_filled, v
+                found_page = pg
+                break
+
+        if not found_label:
+            result["sub_items"][label] = "⏱ 未检测到料号栏"
+            continue
+
+        if filled:
+            note = f"✅ 已填写（{value}）"
+            if cover_pn and value and _PN_VALUE_RE.search(value) and \
+                    value.strip().upper() != cover_pn.strip().upper():
+                note = f"⚠️ 已填写（{value}），与封面料号 {cover_pn} 不一致"
+                result["issues"].append(
+                    f"{label}表头料号「{value}」与封面料号「{cover_pn}」不一致，需核对"
+                )
+            result["sub_items"][label] = note
+            result["items"].append({"label": label, "page": found_page,
+                                    "status": "filled", "value": value})
+        else:
+            result["sub_items"][label] = "❌ 料号栏未填写（空白）"
+            result["issues"].append(
+                f"{label}表头「Part Number(料号)」栏未填写，需供应商补填内部料号"
+            )
+            result["items"].append({"label": label, "page": found_page,
+                                    "status": "empty", "value": ""})
+
+    if any("❌" in v for v in result["sub_items"].values()):
+        result["overall_status"] = "❌ 不合格"
+    elif any("⚠️" in v for v in result["sub_items"].values()):
+        result["overall_status"] = "⚠️ 需人工确认"
+    return result
+
+
 def check_per_item_report_expiry(page_analysis, tables, check_date):
     """
     V5.9.8: 报告逐项时效性检查（通用，所有电子料）。
@@ -1955,20 +2202,35 @@ def check_per_item_report_expiry(page_analysis, tables, check_date):
         return results
     check_day = check_date.date()
 
+    # V5.9.14: 附件形式的报告页内容不可核对，跳过逐项日期判定（避免误报超期）
+    try:
+        _attach_pages = detect_report_attachments(page_analysis, tables)["attachment_pages"]
+    except Exception:
+        _attach_pages = set()
+
     for t_dict in tables:
         tbl = t_dict.get("table", [])
         if not tbl:
             continue
         pg = t_dict.get("page")
+        # V5.9.14: 该页为附件形式报告 → 跳过
+        if pg in _attach_pages:
+            continue
         # 用整表文本分类表格类型
         table_text = " ".join(
             " ".join(str(c) if c else "" for c in row) for row in tbl
         ).lower()
         is_rohs = ("限用物质" in table_text or ("rohs" in table_text and "调查表" in table_text)
                    or "composition questionnaire" in table_text)
+        # V5.9.14: 先识别 REACH 调查表，避免被误判为 SGS
+        is_reach_form = ("reach" in table_text and ("调查表" in table_text or "substance" in table_text)) \
+            or "物质成分调查表" in table_text
         is_sgs = ("材质证明" in table_text or "sgs报告" in table_text
                   or "报告检测时间" in table_text
-                  or ("sgs" in table_text and ("报告" in table_text or "检测" in table_text)))
+                  or ("sgs" in table_text and ("测试报告" in table_text or "材质证明" in table_text)))
+        # V5.9.14: RoHS/REACH 调查表不是材质证明/SGS，剔除误判
+        if is_rohs or is_reach_form:
+            is_sgs = False
         # 若表格文本未命中，用所在页文本兜底判定
         if not (is_rohs or is_sgs):
             page_text = ""
@@ -1978,7 +2240,10 @@ def check_per_item_report_expiry(page_analysis, tables, check_date):
                     break
             if "限用物质" in page_text or "composition questionnaire" in page_text:
                 is_rohs = True
-            elif "材质证明" in page_text or "sgs" in page_text:
+            elif "物质成分调查表" in page_text or (
+                    "reach" in page_text and "调查表" in page_text):
+                pass  # V5.9.14: REACH 调查表页，不是 SGS，不做 SGS 逐项判定
+            elif "材质证明" in page_text:
                 is_sgs = True
         if not (is_rohs or is_sgs):
             continue
@@ -3300,6 +3565,16 @@ def generate_final_verdict_v62(material_type, all_results, standards):
     if lcd_drawing.get("overall_status", "").startswith("❌") and lcd_drawing.get("issues"):
         issues.extend(lcd_drawing["issues"])
 
+    # V5.9.14: 附件形式报告提醒（⚠️ 提示项，计入问题清单但不单独判定不合格）
+    attachment_check = all_results.get("attachment_check", {})
+    if attachment_check.get("issues"):
+        issues.extend(attachment_check["issues"])
+
+    # V5.9.14: 测量报告/CPK报告料号栏校验
+    pn_field_check = all_results.get("pn_field_check", {})
+    if pn_field_check.get("issues"):
+        issues.extend(pn_field_check["issues"])
+
     total_fail = completeness.get("fail_count", 0)
     critical_fail = (
         completeness["status"] == "❌ 不合格"
@@ -3314,6 +3589,7 @@ def generate_final_verdict_v62(material_type, all_results, standards):
         or supplier_check.get("overall_status", "").startswith("❌")  # V5.9.2
         or lcd_bom.get("overall_status", "").startswith("❌")  # V5.9.8
         or lcd_drawing.get("overall_status", "").startswith("❌")  # V5.9.8
+        or pn_field_check.get("overall_status", "").startswith("❌")  # V5.9.14
     )
 
     if critical_fail or len(issues) > 3:
@@ -3431,6 +3707,23 @@ def run_full_inspection(file_path, file_name, standards):
         if globals().get("lcd_drawing_check", True):
             lcd_drawing = check_lcd_drawing_specs(page_analysis, file_path)
 
+    # V5.9.14 新增：附件形式报告提醒
+    attachment_check = (
+        detect_report_attachments(page_analysis, tables)
+        if globals().get("attachment_tip_check", True)
+        else {"overall_status": "⏭️ 未启用", "issues": [], "sub_items": {},
+              "items": [], "attachment_pages": set()}
+    )
+    # V5.9.14 新增：测量报告/CPK报告料号栏校验
+    pn_field_check = (
+        check_report_pn_fields(
+            page_analysis, tables=tables,
+            cover_pn=part_consistency.get("cover_info", {}).get("part_number", ""),
+        )
+        if globals().get("pn_field_checkbox", True)
+        else {"overall_status": "⏭️ 未启用", "issues": [], "sub_items": {}, "items": []}
+    )
+
     # 将逐项过期结果合并进 RoHS / 报告时效性（修复此前max日期遮罩旧报告bug）
     if per_item_expiry["expired_rohs"]:
         rohs["overall_status"] = "❌ 不合格"
@@ -3488,6 +3781,9 @@ def run_full_inspection(file_path, file_name, standards):
         "lcd_drawing": lcd_drawing,
         "per_item_expiry": per_item_expiry,
         "env_requirements": env_req,  # V5.9.10: 封面RoHS/REACH勾选状态
+        # V5.9.14 新增
+        "attachment_check": attachment_check,
+        "pn_field_check": pn_field_check,
     }
     final = generate_final_verdict_v62(mat_type, all_results, standards)
 
@@ -3519,6 +3815,9 @@ def run_full_inspection(file_path, file_name, standards):
         "LCD-BOM组成": lcd_bom["overall_status"],
         "LCD-工程图规格": lcd_drawing["overall_status"],
         "报告逐项时效": per_item_expiry["overall_status"],
+        # V5.9.14 新增
+        "报告附件形式": attachment_check["overall_status"],
+        "测量报告料号": pn_field_check["overall_status"],
         # 原有
         "总体结论": final["verdict"],
         "问题数量": final["issue_count"],
@@ -3557,6 +3856,9 @@ def run_full_inspection(file_path, file_name, standards):
             "lcd_drawing": lcd_drawing,
             "per_item_expiry": per_item_expiry,
             "env_requirements": env_req,  # V5.9.10
+            # V5.9.14 新增
+            "attachment_check": attachment_check,
+            "pn_field_check": pn_field_check,
             #
             "final": final,
         },
@@ -3629,6 +3931,9 @@ part_check = st.sidebar.checkbox("✅ 料号&物料名称跨表一致性（V6.2�
 lcd_check = st.sidebar.checkbox("✅ LCD显示模组专项（BOM组成+工程图规格，自动识别）", value=True)
 lcd_drawing_check = st.sidebar.checkbox("✅ LCD工程图规格校验（DOL/4PB/色坐标/接地阻抗）", value=True)
 peritem_check = st.sidebar.checkbox("✅ 报告逐项时效性（逐项核对RoHS/SGS报告日期≤1年）", value=True)
+# V5.9.14 新增
+attachment_tip_check = st.sidebar.checkbox("📎 附件形式报告提醒（SGS/RoHS/REACH 为压缩包附件时提示）", value=True)
+pn_field_checkbox = st.sidebar.checkbox("🔢 测量报告料号栏校验（全尺寸/CPK报告 Part Number 空白检测）", value=True)
 
 # ============================================================
 # V5.8 复位按钮
@@ -4057,6 +4362,44 @@ with col2:
                         if src == "not_detected":
                             st.caption("💡 提示：部分PDF的环保要求为表单控件，文本引擎可能无法读取。如实际封面已勾选'不需要符合'，可忽略相关缺失项。")
 
+                    # V5.9.14: 附件形式报告提醒
+                    ac = d.get("attachment_check")
+                    if ac and isinstance(ac, dict) and ac.get("items"):
+                        st.subheader("📎 附件形式报告提醒（V5.9.14）")
+                        st.markdown(f"**整体判定:** {ac.get('overall_status', 'N/A')}")
+                        ac_rows = []
+                        for it in ac["items"]:
+                            ac_rows.append({
+                                "页码": it.get("page"),
+                                "报告类型": it.get("type"),
+                                "附件文件名": it.get("filename"),
+                            })
+                        st.dataframe(pd.DataFrame(ac_rows), use_container_width=True, hide_index=True)
+                        st.warning(
+                            "以上报告以附件压缩包形式提供，报告正文未合并进承认书，"
+                            "无法核对报告内容与报告日期，需人工确认或要求供应商提供报告原件。"
+                        )
+                        for msg in ac.get("issues", []):
+                            if "RoHS" in msg and "不可作为附档" in msg:
+                                st.error(msg)
+
+                    # V5.9.14: 测量报告/CPK报告料号栏校验
+                    pc_chk = d.get("pn_field_check")
+                    if pc_chk and isinstance(pc_chk, dict) and pc_chk.get("sub_items"):
+                        st.subheader("🔢 测量报告料号栏校验（V5.9.14）")
+                        st.markdown(f"**整体判定:** {pc_chk.get('overall_status', 'N/A')}")
+                        pn_rows = []
+                        for it in pc_chk.get("items", []):
+                            st_lbl = {"filled": "✅ 已填写", "empty": "❌ 空白"}.get(it.get("status"), "⏱ 未检测")
+                            pn_rows.append({
+                                "报告": it.get("label"),
+                                "页码": it.get("page"),
+                                "料号栏状态": st_lbl,
+                                "填写值": it.get("value") or "—（空白）",
+                            })
+                        if pn_rows:
+                            st.dataframe(pd.DataFrame(pn_rows), use_container_width=True, hide_index=True)
+
                     # 最终处理建议
                     st.subheader("8️⃣ 检验结论与处理建议")
                     st.markdown(f"**{d['final']['verdict']}**")
@@ -4105,6 +4448,8 @@ with col2:
                         ("LCD-BOM组成", dd.get("lcd_bom")),  # V5.9.8
                         ("LCD-工程图规格", dd.get("lcd_drawing")),  # V5.9.8
                         ("环保要求状态", dd.get("env_requirements")),  # V5.9.10
+                        ("报告附件形式", dd.get("attachment_check")),  # V5.9.14
+                        ("测量报告料号", dd.get("pn_field_check")),  # V5.9.14
                     ]
                     
                     for check_name, check_data in checks:
