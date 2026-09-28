@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.15
+封样检验Web应用 - V5.9.16
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -15,6 +15,7 @@ V5.9.11修复：UI渲染NameError崩溃（dd->d变量名笔误）；V5.9.12新�
 V5.9.13修复：LCD识别关键词过宽导致背胶/泡棉等非LCD物料误触发LCD专项检查——增加排除词（背胶/泡棉/胶带/海绵等14项）；LCD核心词仅匹配物料名/文件名；全文辅助需≥3个弱信号才触发
 V5.9.14新增：①附件形式报告检测（SGS/RoHS/REACH以.7z等压缩包提供时提醒无法核对内容，并跳过该页逐项日期判定，修复REACH调查表被误判为SGS导致SGS超期误报）；②全尺寸测量报告/CPK报告表头料号(Part Number)栏空白校验
 V5.9.15修复：①料号一致性检查完全失效——原按table_type排除且含"unknown"导致所有未分类表格被剔除、提前返回"未检测到表头信息"；改为按料号格式(K/R/M+9位以上数字)过滤并取消提前返回，新增可靠性/电气性能/材质证明/QC流程图等类型识别与页面标题兜底分类，按错误料号分组汇总并标注全部页码；②错误汇总Excel新增"页码"列，便于定位PDF中的问题位置
+V5.9.16修复：统一料号编码规则——全部料号正则按《物料编码规则》收紧为「K(结构料)/R(电子料) + 10位数字 + 可选1~2位字母后缀」（新增 INTERNAL_PN_CORE / INTERNAL_PN_FULL_RE / INTERNAL_PN_SEARCH_RE 与 is_internal_part_number() / extract_internal_pn()）；修复旧正则 K\\d{6,} 把第三方报告编号（A2260375586101、A2260558395101001E）与厂商编码误判为内部料号的问题
 """
 
 import streamlit as st
@@ -57,6 +58,56 @@ def load_material_coding_rules():
         return None
     except Exception:
         return None
+
+
+# ============================================================
+# V5.9.16：内部物料编码规则（依据《物料编码规则.xlsx》material_coding_rules.json）
+#   内部料号 = K(结构料) 或 R(电子料) 前缀 + 共 10 位数字 + 可省略的 1~2 位字母后缀
+#   前 4 位数字为类别码（如 K6970=MESH、K6990=FPC、K4610=CAMERA）
+#   示例：K6970000223LA / K4610000607LA / K6990030058LA / R9512000048L
+#   → 第三方报告号（A2260375586101、SHAEC26022994409）、供应商型号
+#     （LMIWH055121571）、材料编码（XCFC-1315WB1）均不得视为内部料号。
+# ============================================================
+INTERNAL_PN_CORE = r'[KR]\d{10}[A-Za-z]{0,2}'
+# 完整校验（整串即料号）
+INTERNAL_PN_FULL_RE = re.compile(r'^[KR]\d{10}[A-Za-z]{0,2}$')
+# 从文本中搜索（带边界，避免命中更长的字母数字串）
+INTERNAL_PN_SEARCH_RE = re.compile(r'(?<![A-Za-z0-9])[KR]\d{10}[A-Za-z]{0,2}(?![A-Za-z0-9])')
+
+
+def extract_internal_pn(text, legacy_fallback=True):
+    """
+    V5.9.16: 按《物料编码规则》从文本中提取内部料号（K/R + 10位数字 + 可选后缀）。
+    legacy_fallback=True 时，若严格规则未命中，回退到旧格式（K/R + 6位以上数字），
+    以兼容历史文档中位数不规范的料号。
+    """
+    if not text:
+        return ""
+    s = str(text)
+    m = INTERNAL_PN_SEARCH_RE.search(s)
+    if m:
+        return m.group(0)
+    if legacy_fallback:
+        m = re.search(r'(?<![A-Za-z0-9])([KR]\d{6,}[A-Za-z]{0,3})', s)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def is_internal_part_number(pn, strict=True):
+    """
+    V5.9.16: 判断字符串是否为符合编码规则的内部料号。
+    strict=True  → 整串必须严格等于 K/R + 10位数字 + 可选1~2位字母
+    strict=False → 允许在字符串中搜索出符合条件的料号片段
+    """
+    if not pn:
+        return False
+    s = str(pn).strip().upper().replace(" ", "")
+    if not s:
+        return False
+    if strict:
+        return bool(INTERNAL_PN_FULL_RE.match(s))
+    return bool(INTERNAL_PN_SEARCH_RE.search(s))
 
 def identify_material_type(part_number, coding_rules):
     """
@@ -2053,7 +2104,8 @@ def detect_report_attachments(page_analysis, tables=None):
 
 # --- 料号栏(Part Number)校验辅助 ---
 _PN_LABEL_RE = re.compile(r'(part\s*(?:number|no\.?)|料号)', re.I)
-_PN_VALUE_RE = re.compile(r'[A-Za-z]{1,2}\d{6,}[A-Za-z]{0,3}')
+# V5.9.16: 按《物料编码规则》判定内部料号：K/R + 10位数字 + 可选1~2位字母
+_PN_VALUE_RE = INTERNAL_PN_SEARCH_RE
 _PN_LABEL_HINTS = [
     "vendor", "供应商", "tool number", "模号", "cav", "穴数", "unit", "单位",
     "material", "材质", "description", "零件名称", "inspected", "确认者",
@@ -2369,17 +2421,17 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                     cell_str = str(cell).strip()
                     # 料号匹配：K+数字 格式 或 Material number 标签行
                     if not result["part_number"]:
-                        pn_in_cell = re.search(r'(K\d{6,}[A-Za-z]*)', cell_str)
+                        pn_in_cell = extract_internal_pn(cell_str)
                         if pn_in_cell:
-                            result["part_number"] = pn_in_cell.group(1).strip()
+                            result["part_number"] = pn_in_cell.strip()
                             result["page_num"] = tbl_page
                         elif re.search(r'material\s*(number|no\.?)|物料编号|part\s*number', cell_str, re.IGNORECASE):
                             # 标签单元格，值在右侧相邻单元格
                             for nc in row[ci+1:]:
                                 if nc is not None and str(nc).strip():
-                                    nv = re.search(r'(K\d{6,}[A-Za-z]*)', str(nc).strip())
+                                    nv = extract_internal_pn(str(nc).strip())
                                     if nv:
-                                        result["part_number"] = nv.group(1).strip()
+                                        result["part_number"] = nv.strip()
                                         result["page_num"] = tbl_page
                                     break
 
@@ -2538,9 +2590,9 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                         continue
                     cell_str = str(cell).strip()
                     # 提取料号
-                    pn_match = _re.search(r'(K\d{6,}[A-Za-z]*)', cell_str)
-                    if pn_match and not result["part_number"]:
-                        result["part_number"] = pn_match.group(1).strip()
+                    pn_val = extract_internal_pn(cell_str)
+                    if pn_val and not result["part_number"]:
+                        result["part_number"] = pn_val.strip()
                         result["page_num"] = tbl_page
                     # V5.8.2增强：提取物料名称（支持中英文名称）
                     if not result["material_name"] and _is_cover_tbl:
@@ -2881,14 +2933,18 @@ def extract_table_headers_part_info(page_analysis, tables=None):
                     # 判断当前单元格是否是料号标签，且本身不包含有效料号
                     is_pn_label = (
                         re.search(r'part\s*(?:no\.?|number)|料号|零件号|material\s*(?:number|no\.?)|物料编号', cell_lower)
-                        and not re.search(r'[A-Za-z]{0,2}\d{6,}', cell_str)
+                        # V5.9.16: 仅当标签单元格内不含合法内部料号时才视为纯标签
+                        and not is_internal_part_number(cell_str, strict=False)
                     )
                     if is_pn_label and ci + 1 < len(row):
                         for next_cell in row[ci + 1:]:
                             if next_cell is not None and str(next_cell).strip():
                                 nv = str(next_cell).strip()
-                                # 验证是否为有效料号（允许 R/M/S/NC/XC/K 等前缀）
-                                if re.match(r'^[A-Za-z]{0,2}\d{6,}[\w\-]*$', nv):
+                                # 验证是否为有效料号（优先按 K/R + 10位数字 编码规则）
+                                if is_internal_part_number(nv, strict=True):
+                                    part_number = nv
+                                    break
+                                elif re.match(r'^[A-Za-z]{0,2}\d{6,}[\w\-]*$', nv):
                                     part_number = nv
                                     break
                                 elif re.match(r'^[A-Za-z0-9_\-]{7,}$', nv):
@@ -2941,19 +2997,22 @@ def extract_table_headers_part_info(page_analysis, tables=None):
 
                     # --- 料号精确匹配 ---
                     pn_cell_patterns = [
-                        r'^[A-Za-z]{1,2}\d{8,}[\w\-]*$',       # 纯料号如 K6340000520LA
-                        r'^(K|M|S|NC|XC)[A-Za-z0-9_\-]{6,}$',   # 常见前缀开头的料号
+                        # V5.9.16: 优先按《物料编码规则》严格匹配 K/R + 10位数字 + 可选后缀
+                        r'^[KR]\d{10}[A-Za-z]{0,2}$',
+                        r'^[A-Za-z]{1,2}\d{8,}[\w\-]*$',       # 兜底：纯料号如 K6340000520LA
+                        r'^(K|M|S|NC|XC)[A-Za-z0-9_\-]{6,}$',   # 兜底：常见前缀开头的料号
                     ]
                     is_pn_cell = any(re.match(pat, cell_str) for pat in pn_cell_patterns)
 
                     # 如果当前单元格像部分料号（如 K6340000520），尝试与下一单元格合并
-                    if not is_pn_cell and re.match(r'^(K|M)[0-9]{6,}$', cell_str):
+                    if not is_pn_cell and re.match(r'^([KR]|M)[0-9]{6,}$', cell_str):
                         # 检查下一个或几个单元格是否能拼接成完整料号
                         combined = cell_str
                         for next_ci in range(start_ci + 1, min(start_ci + 3, len(cell_texts))):
                             if cell_texts[next_ci]:
                                 combined += cell_texts[next_ci]
-                                if re.match(r'^[A-Za-z]{1,2}\d{8,}[\w\-]*$', combined):
+                                if re.match(r'^[KR]\d{10}[A-Za-z]{0,2}$', combined) or \
+                                        re.match(r'^[A-Za-z]{1,2}\d{8,}[\w\-]*$', combined):
                                     part_number = combined
                                     break
                             else:
@@ -3062,7 +3121,12 @@ def extract_table_headers_part_info(page_analysis, tables=None):
 
             # V5.8.7: 只有提取到有效料号或有效名称时才添加结果
             # 过滤掉明显无效的结果（如表头标题、说明文字等）
-            _is_valid_pn = bool(part_number and re.match(r'^[A-Za-z]{0,2}\d{6,}[\w\-]*$', part_number))
+            # V5.9.16: 优先按《物料编码规则》判定，其次回退到宽松格式
+            _is_valid_pn = bool(
+                part_number
+                and (is_internal_part_number(part_number, strict=True)
+                     or re.match(r'^[A-Za-z]{0,2}\d{6,}[\w\-]*$', part_number))
+            )
             # 名称有效性检查：必须不是表头/标题/说明文字
             _bad_name_prefixes = (
                 'sample acknowledgement', '样品承认书', 'catalog', '目录',
@@ -3350,18 +3414,22 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
         "issues": [],
     }
 
-    # V5.9.7: 预提取文件名料号（支持多种料号前缀：R/M/S/NC/XC/K 等）
+    # V5.9.16: 文件名料号提取 —— 严格遵循《物料编码规则》：K/R + 10位数字 + 可选1~2位字母
     # 优先使用调用方传入的原始 file_name，避免Cloud临时路径导致文件名丢失
-    # 关键：使用负向回顾/前瞻，避免从厂商长编码（如 LMIWH055121571）中误提取 WH055121571
+    # 关键：使用负向回顾/前瞻 + K/R 前缀限定，避免误提取
+    #   - 厂商长编码 LMIWH055121571 → 不会误提 WH055121571（非 K/R 开头）
+    #   - 第三方报告号 A2260375586101、SHAEC26022994409 → 均不匹配
     _fname = (file_name if file_name else os.path.basename(pdf_path)) if file_name or pdf_path else ""
-    _fn_pn_match = re.search(
-        r'(?<![A-Za-z])([A-Za-z]{1,2}\d{8,}[A-Za-z]{0,2})(?![A-Za-z0-9])',
-        _fname,
-        re.IGNORECASE
-    )
     _fn_pn = None
+    # 必须保留原文件名中的"-"/"_"作为天然分隔符；若先去掉连字符，料号会紧贴
+    # 前缀词（如 CRS-K6990… 变成 CRSK6990…），导致前边界断言失效而提取不到料号。
+    _fn_upper = _fname.upper()
+    _fn_pn_match = INTERNAL_PN_SEARCH_RE.search(_fn_upper)
+    if not _fn_pn_match:
+        # 兜底：料号与后缀被分隔符拆开（如 K4610000607-LA）时，仅取 K/R + 10位数字
+        _fn_pn_match = re.search(r'(?<![A-Za-z0-9])([KR]\d{10})', _fn_upper)
     if _fn_pn_match:
-        _fn_pn = _fn_pn_match.group(1).upper().replace(" ", "").replace("-", "")
+        _fn_pn = _fn_pn_match.group(0).upper().replace(" ", "")
     result["filename_part_number"] = _fn_pn  # 供UI/Excel展示
 
     # Step 1: 提取封面的料号和物料名称
@@ -3388,15 +3456,12 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
     #   导致各文档料号全部"未找到"、料号一致性检查形同虚设。
     #   改为按【料号格式】过滤：仅比对形如内部物料编码（如 K6990030058LA）的表格料号，
     #   第三方材料编码（如 XCFC-1315WB1）、检测机构报告号（如 SHAEC26022994409）自动排除。
-    _INTERNAL_PN_RE = re.compile(r'^[A-Za-z]{1,2}\d{8,}[A-Za-z]{0,2}$')
-    # 仍排除确无料号可比对的页面类型
+    # V5.9.16: 过滤规则改为严格遵循《物料编码规则》—— K/R + 10位数字 + 可选1~2位字母
+    #   仍排除确无料号可比对的页面类型
     _external_report_types = {"样品照片"}
 
     def _is_internal_pn(pn):
-        if not pn:
-            return False
-        norm = str(pn).upper().replace(" ", "").replace("-", "")
-        return bool(_INTERNAL_PN_RE.match(norm))
+        return is_internal_part_number(pn, strict=True)
 
     _internal_table_infos = [
         ti for ti in table_infos
@@ -3822,10 +3887,8 @@ def run_full_inspection(file_path, file_name, standards):
     if _coding_rules:
         _pn = part_consistency.get("cover_info", {}).get("part_number", "")
         if not _pn:
-            # 如果封面没提取到，尝试从文件名提取
-            _pn_match = re.search(r"([A-Za-z]\d{4}\d+[A-Za-z]*)", file_name)
-            if _pn_match:
-                _pn = _pn_match.group(1)
+            # 如果封面没提取到，尝试从文件名提取（V5.9.16: 按编码规则 K/R + 10位数字）
+            _pn = extract_internal_pn(file_name, legacy_fallback=True)
         if _pn:
             _mat_info = identify_material_type(_pn, _coding_rules)
             if _mat_info["成功"]:
