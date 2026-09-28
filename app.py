@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.16
+封样检验Web应用 - V5.9.17
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -16,6 +16,7 @@ V5.9.13修复：LCD识别关键词过宽导致背胶/泡棉等非LCD物料误触
 V5.9.14新增：①附件形式报告检测（SGS/RoHS/REACH以.7z等压缩包提供时提醒无法核对内容，并跳过该页逐项日期判定，修复REACH调查表被误判为SGS导致SGS超期误报）；②全尺寸测量报告/CPK报告表头料号(Part Number)栏空白校验
 V5.9.15修复：①料号一致性检查完全失效——原按table_type排除且含"unknown"导致所有未分类表格被剔除、提前返回"未检测到表头信息"；改为按料号格式(K/R/M+9位以上数字)过滤并取消提前返回，新增可靠性/电气性能/材质证明/QC流程图等类型识别与页面标题兜底分类，按错误料号分组汇总并标注全部页码；②错误汇总Excel新增"页码"列，便于定位PDF中的问题位置
 V5.9.16修复：统一料号编码规则——全部料号正则按《物料编码规则》收紧为「K(结构料)/R(电子料) + 10位数字 + 可选1~2位字母后缀」（新增 INTERNAL_PN_CORE / INTERNAL_PN_FULL_RE / INTERNAL_PN_SEARCH_RE 与 is_internal_part_number() / extract_internal_pn()）；修复旧正则 K\\d{6,} 把第三方报告编号（A2260375586101、A2260558395101001E）与厂商编码误判为内部料号的问题
+V5.9.17修复：①新增 APP_CODE_VERSION 代码版本标识（界面顶部与侧边栏显示"代码版本"，与只反映 JSON 内容的"标准版本"区分开，可一眼确认线上跑的是哪一版 app.py）；②料号一致性彻底取消"提前返回"——旧逻辑某个来源为空就直接 return，界面只剩一句"未检测到…"，无法判断是封面/表头/文件名哪一步失效；现改为输出「料号检出诊断」（文件名料号、封面料号及其来源、检出表格数、被排除表格数、各表头料号明细）；③无任何可对比项时不再默认显示"✅ 全部一致"（假阳性），改为"⚠️ 未检出可对比的表头料号（请人工核对）"
 """
 
 import streamlit as st
@@ -28,6 +29,16 @@ import re
 import pdfplumber
 import pypdfium2 as pdfium  # V5.9.5: 高性能PDF文本预提取
 import gc  # V5.1: 内存管理 - 显式垃圾回收
+
+# ============================================================
+# V5.9.17: 代码版本标识（只读自 app.py 本身）
+#   —— 用于快速判定"线上跑的是哪一版代码"。
+#   与从 inspection_standards.json 读取的"标准版本"区分开：
+#   标准版本只反映 JSON 内容，代码版本才反映 app.py 的真实逻辑。
+#   ★ 每次改动 app.py 逻辑，必须同步 +1，否则无法定位线上版本。
+# ============================================================
+APP_CODE_VERSION = "V5.9.17"
+APP_CODE_DATE = "2026-09-28"
 
 # ============================================================
 # 标准文件读取
@@ -3438,10 +3449,12 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
 
     # V5.9.6: 封面提取失败或只提取到标签词时，用文件名料号作为参考
     _cover_pn_valid = bool(cover["part_number"] and len(re.findall(r'\d', cover["part_number"])) >= 4)
+    _cover_pn_from_fn = False  # V5.9.17: 记录封面料号是"原文提取"还是"文件名兜底"
     if not _cover_pn_valid and _fn_pn:
         cover = dict(cover)
         cover["part_number"] = _fn_pn
         result["cover_info"] = cover
+        _cover_pn_from_fn = True
 
     if not cover["part_number"] and not cover["material_name"]:
         result["overall_status"] = "⏱ 无法提取封面信息"
@@ -3471,12 +3484,25 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
     # 同时记录被排除的表格（用于信息展示）
     _excluded_count = len(table_infos) - len(_internal_table_infos)
 
-    # V5.9.15: 不再提前返回 —— 即使内部表格为空，也要继续执行"文件名 vs 文档"料号比对，
-    #   否则封面/表格提取不到的文档会完全漏检（如文档内料号与文件名整体不符）。
-    if not _internal_table_infos and not _fn_pn and not cover.get("part_number"):
-        result["overall_status"] = "⚠️ 未检测到其他表格的表头信息"
-        result["issues"].append("未在各报告表头中找到料号/物料名称信息（已排除外部检测报告）")
-        return result
+    # V5.9.17: 彻底取消"提前返回"——无论提取到什么，都输出诊断信息并继续走完比对流程。
+    #   旧逻辑一旦某个来源为空就直接 return，界面只剩一句"未检测到…"，
+    #   既无法判断是哪一步失效（封面？表头？文件名？），也让人误以为功能失效。
+    result["diag"] = {
+        "文件名料号": _fn_pn or "（未提取到）",
+        "封面料号": (cover.get("part_number") or "（未提取到）"),
+        "封面料号来源": "文件名兜底（封面未提取到）" if _cover_pn_from_fn else "封面原文提取",
+        "封面物料名称": (cover.get("material_name") or "（未提取到）"),
+        "检出表格总数": len(table_infos),
+        "其中含内部料号的表格": len(_internal_table_infos),
+        "被排除的表格": _excluded_count,
+    }
+    if not _internal_table_infos and not _fn_pn and not (cover.get("part_number") or ""):
+        # 三处来源全空 → 明确告知缺什么，而不是含糊的"未检测到表头信息"
+        result["overall_status"] = "⚠️ 未检出料号（封面/表头/文件名均为空）"
+        result["issues"].append(
+            f"未在任何位置提取到料号：检出表格 {len(table_infos)} 个、文件名料号为空、封面料号为空；"
+            f"请确认该 PDF 是否为扫描件（无文本层）"
+        )
 
     # Step 3: 逐一比对（仅对比内部表格）
     ref_pn = cover["part_number"]
@@ -3628,10 +3654,33 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
                 "name_detail": "",
             })
 
+    # V5.9.17: 若全程没有任何"可对比项"，不能显示"✅ 全部一致"（那是假阳性），
+    #   要明确说明"没检出可对比的表头料号"，并给出文件名/封面料号供人工核对。
+    _no_comparable = not result["consistency_checks"]
+    if _no_comparable:
+        _fn_show = _fn_pn or "（未提取到）"
+        _cov_show = cover.get("part_number") or "（未提取到）"
+        result["consistency_checks"].append({
+            "table_type": "未检出可比对表格",
+            "page_num": 0,
+            "page_nums": [],
+            "pn_match": "⏱ 无表头料号",
+            "name_match": "—",
+            "pn_detail": (f"各报告表头均未提取到内部料号（检出表格 {len(table_infos)} 个）；"
+                          f"参照：文件名={_fn_show}，封面={_cov_show}"),
+            "name_detail": "",
+        })
+        result["issues"].append(
+            f"料号一致性未能完成比对：{len(table_infos)} 个表格中无可识别的内部料号；"
+            f"文件名料号={_fn_show}，封面料号={_cov_show}（建议人工核对表头料号栏）"
+        )
+
     # V5.8.3 修复：判定整体状态
     # 料号一致性检查的核心是**料号(Part Number)**的一致性，物料名称仅作参考
     # 只有料号不一致才判定为❌不合格；物料名称不一致仅记录为⚠️警告
     has_pn_mismatch = any("❌" in str(c.get("pn_match", "")) for c in result["consistency_checks"])
+    has_pn_missing = any(("⏱" in str(c.get("pn_match", ""))) and c.get("table_type") != "未检出可比对表格"
+                         for c in result["consistency_checks"])
     has_pn_minor = any("⚠️" in str(c.get("pn_match", "")) for c in result["consistency_checks"])
     has_name_mismatch = any("❌" in str(c.get("name_match", "")) for c in result["consistency_checks"])
     has_name_minor = any("⚠️" in str(c.get("name_match", "")) for c in result["consistency_checks"])
@@ -3643,8 +3692,13 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
                 result["issues"].remove(issue)
                 result["issues"].append(issue.replace("❌", "⚠️").replace("不一致", "存在差异(参考)"))
 
-    if has_pn_mismatch:
+    if _no_comparable:
+        # 保持上面设置的"未检出可对比的表头料号"，不要被覆盖成"✅ 全部一致"
+        pass
+    elif has_pn_mismatch:
         result["overall_status"] = "❌ 存在不一致"
+    elif has_pn_missing:
+        result["overall_status"] = "⚠️ 部分表头未检出料号（请人工核对）"
     elif has_pn_minor or has_name_mismatch:
         result["overall_status"] = "⚠️ 基本一致（有微小差异）"
     else:
@@ -4031,11 +4085,13 @@ last_updated = standards.get("last_updated", "未知")
 
 # 标题区
 st.title("📋 封样检验应用")
-st.caption(f"基于 XC-R-0802-DQM-002 物料正式样品承认书模板 | 标准版本 V{version} | 更新于 {last_updated}")
+st.caption(f"基于 XC-R-0802-DQM-002 物料正式样品承认书模板 | 代码版本 {APP_CODE_VERSION} | 标准版本 V{version} | 更新于 {last_updated}")
 st.markdown("---")
 
 # 侧边栏设置
 st.sidebar.header("⚙️ 审核标准设置")
+# V5.9.17: 醒目的代码版本标识（读自 app.py 自身，用于确认线上跑的是哪一版代码）
+st.sidebar.caption(f"🧩 代码版本 **{APP_CODE_VERSION}**（{APP_CODE_DATE}）｜标准版本 V{version}")
 
 # 从标准文件动态生成选项
 electronic_items = standards.get("file_completeness", {}).get("electronic", {}).get("items", [])
@@ -4432,6 +4488,30 @@ with col2:
                                 })
                             pc_df = pd.DataFrame(pc_rows)
                             st.dataframe(pc_df, use_container_width=True, hide_index=True)
+
+                        # V5.9.17: 料号检出诊断信息 —— 一眼看清"文件名/封面/表头"各自抓到了什么，
+                        #   避免只显示一句"未检测到"而无法定位问题
+                        _diag = pc.get("diag")
+                        if isinstance(_diag, dict) and _diag:
+                            with st.expander("🔍 料号检出诊断（点开确认各来源抓到了什么）", expanded=False):
+                                st.dataframe(
+                                    pd.DataFrame([{"项目": k, "值": str(v)} for k, v in _diag.items()]),
+                                    use_container_width=True, hide_index=True,
+                                )
+                                _ti_list = pc.get("table_infos") or []
+                                if _ti_list:
+                                    st.markdown(f"**各表头检出的料号（共 {len(_ti_list)} 条）**")
+                                    st.dataframe(
+                                        pd.DataFrame([{
+                                            "页码": t.get("page_num"),
+                                            "报告类型": t.get("table_type"),
+                                            "料号": t.get("part_number"),
+                                            "物料名称": str(t.get("material_name") or "")[:40],
+                                        } for t in _ti_list]),
+                                        use_container_width=True, hide_index=True,
+                                    )
+                                else:
+                                    st.warning("未从任何报告表头提取到料号 —— 若该 PDF 是扫描件（无文本层），属正常情况，需人工核对。")
 
                     # V5.9.2 新增：封面供应商信息完整性
                     if d.get("supplier_check"):
