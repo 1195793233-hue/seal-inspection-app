@@ -3514,15 +3514,18 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
         if ref_pn:
             _ref_pn_norm = ref_pn.upper().replace(" ", "").replace("-", "")
             if _fn_pn != _ref_pn_norm:
+                _cov_pg = cover.get("page_num") or 1
                 result["issues"].append(
-                    f"[文件名 vs 封面] 料号不一致：文件名'{_fn_pn}' ≠ 封面料号'{ref_pn}'"
+                    f"[文件名 vs 文档料号(第{_cov_pg}页)] 料号不一致："
+                    f"文件名'{_fn_pn}' ≠ 文档料号'{ref_pn}'"
                 )
                 result["consistency_checks"].append({
-                    "table_type": "文件名 vs 封面",
-                    "page_num": 0,
+                    "table_type": "文件名 vs 文档料号",
+                    "page_num": _cov_pg,
+                    "page_nums": [_cov_pg],
                     "pn_match": "❌ 不一致",
                     "name_match": None,
-                    "pn_detail": f"文件名:{_fn_pn} ≠ 封面:{ref_pn}",
+                    "pn_detail": f"文件名:{_fn_pn} ≠ 文档料号:{ref_pn}",
                     "name_detail": "",
                 })
 
