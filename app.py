@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.14
+封样检验Web应用 - V5.9.15
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -14,6 +14,7 @@ V5.9.10修复：RoHS/REACH报告条件性检查（根据封面"物料环保要�
 V5.9.11修复：UI渲染NameError崩溃（dd->d变量名笔误）；V5.9.12新增：供应商签名/盖章（SI-6）必填检查——封面「Supplier signature (with company seal)」Signature栏位不能为空，必须有签名或盖章
 V5.9.13修复：LCD识别关键词过宽导致背胶/泡棉等非LCD物料误触发LCD专项检查——增加排除词（背胶/泡棉/胶带/海绵等14项）；LCD核心词仅匹配物料名/文件名；全文辅助需≥3个弱信号才触发
 V5.9.14新增：①附件形式报告检测（SGS/RoHS/REACH以.7z等压缩包提供时提醒无法核对内容，并跳过该页逐项日期判定，修复REACH调查表被误判为SGS导致SGS超期误报）；②全尺寸测量报告/CPK报告表头料号(Part Number)栏空白校验
+V5.9.15修复：①料号一致性检查完全失效——原按table_type排除且含"unknown"导致所有未分类表格被剔除、提前返回"未检测到表头信息"；改为按料号格式(K/R/M+9位以上数字)过滤并取消提前返回，新增可靠性/电气性能/材质证明/QC流程图等类型识别与页面标题兜底分类，按错误料号分组汇总并标注全部页码；②错误汇总Excel新增"页码"列，便于定位PDF中的问题位置
 """
 
 import streamlit as st
@@ -2172,7 +2173,7 @@ def check_report_pn_fields(page_analysis, tables=None, cover_pn=""):
         else:
             result["sub_items"][label] = "❌ 料号栏未填写（空白）"
             result["issues"].append(
-                f"{label}表头「Part Number(料号)」栏未填写，需供应商补填内部料号"
+                f"{label}（第{found_page}页）表头「Part Number(料号)」栏未填写，需供应商补填内部料号"
             )
             result["items"].append({"label": label, "page": found_page,
                                     "status": "empty", "value": ""})
@@ -2268,7 +2269,7 @@ def check_per_item_report_expiry(page_analysis, tables, check_date):
             if days > 365:
                 label = "RoHS限用物质报告" if is_rohs else "材质证明/SGS报告"
                 kind = "RoHS" if is_rohs else "SGS"
-                msg = (f"{label}逐项过期：材料「{name or '未识别'}」报告日期 {oldest}，"
+                msg = (f"{label}逐项过期（第{pg}页）：材料「{name or '未识别'}」报告日期 {oldest}，"
                        f"距今 {days} 天 > 365 天（需重新提供）")
                 results["issues"].append(msg)
                 results["sub_items"][f"{kind}_逐项_{name or '未识别'}"] = f"❌ {msg}"
@@ -2795,11 +2796,25 @@ def extract_table_headers_part_info(page_analysis, tables=None):
 
             first_rows_lower = first_rows_text.lower()
 
+            # V5.9.15: 页面标题通常位于表格区域之外（不在表格前3行内），
+            #   因此始终将所在页文本并入后再分类；分类链按"标题特征从强到弱"排序，
+            #   避免正文中偶然出现的词（如包装说明里的 reliability）造成误判。
+            _pt = ""
+            for _p in (page_analysis or []):
+                if _p.get("page_num") == page_num:
+                    _pt = _p.get("text") or ""
+                    break
+            if _pt:
+                first_rows_text = first_rows_text + " " + _pt
+                first_rows_lower = first_rows_text.lower()
+
             if "rohs" in first_rows_lower and ("survey" in first_rows_lower or "调查表" in first_rows_text):
                 table_type = "RoHS调查表"
             elif "rohs" in first_rows_lower and ("test report" in first_rows_lower or "测试报告" in first_rows_text):
                 table_type = "RoHS测试报告"
-            elif "reach" in first_rows_lower:
+            elif "reach" in first_rows_lower and ("调查表" in first_rows_text
+                                                  or "substance" in first_rows_lower
+                                                  or "test report" in first_rows_lower):
                 table_type = "REACH报告"
             elif "cpk" in first_rows_lower:
                 table_type = "CPK报告"
@@ -2813,6 +2828,16 @@ def extract_table_headers_part_info(page_analysis, tables=None):
                 table_type = "物料清单"
             elif "packaging method" in first_rows_lower or "包装方式" in first_rows_text:
                 table_type = "包装方式"
+            elif "reliability" in first_rows_lower or "可靠性" in first_rows_text:
+                table_type = "可靠性测试报告"
+            elif "electrical performance" in first_rows_lower or "电气性能" in first_rows_text:
+                table_type = "电气性能测试报告"
+            elif "qc flow" in first_rows_lower or "qc流程图" in first_rows_text.lower():
+                table_type = "QC流程图"
+            elif ("material certificate" in first_rows_lower or "材质证明" in first_rows_text
+                  or ("sgs" in first_rows_lower
+                      and ("report" in first_rows_lower or "报告" in first_rows_text))):
+                table_type = "材质证明/SGS报告"
 
             # 从表格中提取料号和物料名称
             part_number = ""
@@ -3359,21 +3384,31 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
     table_infos = extract_table_headers_part_info(page_analysis, tables=tables)  # V5.4: 使用预提取表格
     result["table_infos"] = table_infos
 
-    # V5.8.5/V5.8.7：过滤掉外部检测报告、调查表和非关键页面，只对比文档内部核心表格
-    # 外部报告/调查表的料号格式可能与内部不同（如Supplier P/N），不具备可比性
-    _external_report_types = {
-        "RoHS测试报告", "RoHS调查表", "REACH报告", "CPK报告",
-        "SGS报告", "华测报告", "材质证明",
-        # V5.8.7: 以下页面类型不参与料号一致性对比
-        "包装方式", "样品照片", "unknown",  # unknown类型通常是非标准格式页面
-    }
+    # V5.9.15 修复：原先按 table_type 排除（含 "unknown"）会把所有未分类表格全部剔除，
+    #   导致各文档料号全部"未找到"、料号一致性检查形同虚设。
+    #   改为按【料号格式】过滤：仅比对形如内部物料编码（如 K6990030058LA）的表格料号，
+    #   第三方材料编码（如 XCFC-1315WB1）、检测机构报告号（如 SHAEC26022994409）自动排除。
+    _INTERNAL_PN_RE = re.compile(r'^[A-Za-z]{1,2}\d{8,}[A-Za-z]{0,2}$')
+    # 仍排除确无料号可比对的页面类型
+    _external_report_types = {"样品照片"}
+
+    def _is_internal_pn(pn):
+        if not pn:
+            return False
+        norm = str(pn).upper().replace(" ", "").replace("-", "")
+        return bool(_INTERNAL_PN_RE.match(norm))
+
     _internal_table_infos = [
-        ti for ti in table_infos if ti.get("table_type", "unknown") not in _external_report_types
+        ti for ti in table_infos
+        if ti.get("table_type", "unknown") not in _external_report_types
+        and _is_internal_pn(ti.get("part_number"))
     ]
-    # 同时记录被排除的外部报告（用于信息展示）
+    # 同时记录被排除的表格（用于信息展示）
     _excluded_count = len(table_infos) - len(_internal_table_infos)
 
-    if not _internal_table_infos:
+    # V5.9.15: 不再提前返回 —— 即使内部表格为空，也要继续执行"文件名 vs 文档"料号比对，
+    #   否则封面/表格提取不到的文档会完全漏检（如文档内料号与文件名整体不符）。
+    if not _internal_table_infos and not _fn_pn and not cover.get("part_number"):
         result["overall_status"] = "⚠️ 未检测到其他表格的表头信息"
         result["issues"].append("未在各报告表头中找到料号/物料名称信息（已排除外部检测报告）")
         return result
@@ -3381,6 +3416,22 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
     # Step 3: 逐一比对（仅对比内部表格）
     ref_pn = cover["part_number"]
     ref_name = cover["material_name"]
+
+    # V5.9.15: 封面物料名称若只是表头碎片（如 "Numbe\nr 数量"），不参与名称比对，避免大量噪声告警
+    def _looks_like_name_fragment(s):
+        if not s:
+            return True
+        v = re.sub(r'\s', '', str(s)).lower()
+        if len(v) < 4:
+            return True
+        _frag_words = ["数量", "number", "序号", "item", "日期", "date",
+                       "备注", "remark", "签名", "sign", "单位", "unit",
+                       "版本", "revision"]
+        _hits = sum(1 for w in _frag_words if w in v)
+        return _hits >= 1 and len(v) <= 14
+
+    if _looks_like_name_fragment(ref_name):
+        ref_name = ""
 
     for ti in _internal_table_infos:
         table_type = ti["table_type"]
@@ -3475,24 +3526,39 @@ def check_part_number_consistency(page_analysis, pdf_path, tables=None, file_nam
                     "name_detail": "",
                 })
 
-        # 4.2 与内部各表格料号比对（封面提取失败时可在此发现差异）
+        # 4.2 与内部各表格料号比对
+        # V5.9.15: 按"文档内错误料号"分组汇总，避免同一问题重复十余条；
+        #   并在问题描述中列出全部涉及页码，便于在PDF中快速定位。
+        _mismatch_groups = {}
         for ti in _internal_table_infos:
             _tp = ti.get("part_number")
-            if _tp:
-                _tp_norm = _tp.upper().replace(" ", "").replace("-", "")
-                if _fn_pn != _tp_norm:
-                    result["issues"].append(
-                        f"[文件名 vs {ti.get('table_type', '未知')}(第{ti.get('page_num', 0)}页)] "
-                        f"料号不一致：文件名'{_fn_pn}' ≠ 表头'{_tp}'"
-                    )
-                    result["consistency_checks"].append({
-                        "table_type": f"文件名 vs {ti.get('table_type', '未知')}",
-                        "page_num": ti.get("page_num", 0),
-                        "pn_match": "❌ 不一致",
-                        "name_match": None,
-                        "pn_detail": f"文件名:{_fn_pn} ≠ 表头:{_tp}",
-                        "name_detail": "",
-                    })
+            if not _tp:
+                continue
+            _tp_norm = _tp.upper().replace(" ", "").replace("-", "")
+            if _fn_pn != _tp_norm:
+                _key = str(_tp).upper().replace(" ", "")
+                g = _mismatch_groups.setdefault(_key, {"pages": [], "types": []})
+                if ti.get("page_num"):
+                    g["pages"].append(ti["page_num"])
+                g["types"].append(str(ti.get("table_type", "未知")))
+
+        for _wrong_pn, g in _mismatch_groups.items():
+            _pages = sorted(set(g["pages"]))
+            _page_str = "、".join(f"第{p}页" for p in _pages) if _pages else "页码未识别"
+            _types = sorted(set(g["types"]))
+            result["issues"].append(
+                f"[文件名 vs 文档内表头] 料号不一致：文件名'{_fn_pn}' ≠ 文档内料号'{_wrong_pn}'"
+                f"（共{len(_pages)}处：{_page_str}）"
+            )
+            result["consistency_checks"].append({
+                "table_type": f"文件名 vs 文档内表头（{'、'.join(_types[:3])}）",
+                "page_num": _pages[0] if _pages else 0,
+                "page_nums": _pages,
+                "pn_match": "❌ 不一致",
+                "name_match": None,
+                "pn_detail": f"文件名:{_fn_pn} ≠ 文档内:{_wrong_pn}（{_page_str}）",
+                "name_detail": "",
+            })
 
     # V5.8.3 修复：判定整体状态
     # 料号一致性检查的核心是**料号(Part Number)**的一致性，物料名称仅作参考
@@ -4288,11 +4354,15 @@ with col2:
                         if consistency_checks:
                             pc_rows = []
                             for cc in consistency_checks:
+                                # V5.9.15: 分组汇总项显示全部涉及页码
+                                _pgs = cc.get("page_nums") or ([cc["page_num"]] if cc.get("page_num") else [])
+                                _pg_str = "、".join(str(p) for p in _pgs) if _pgs else "—"
                                 pc_rows.append({
                                     "报告类型": cc["table_type"],
-                                    "页码": cc["page_num"],
+                                    "页码": _pg_str,
                                     "料号匹配": cc.get("pn_match", ""),
                                     "名称匹配": cc.get("name_match", ""),
+                                    "详情": cc.get("pn_detail", "") or cc.get("name_detail", ""),
                                 })
                             pc_df = pd.DataFrame(pc_rows)
                             st.dataframe(pc_df, use_container_width=True, hide_index=True)
@@ -4430,6 +4500,33 @@ with col2:
                 ws_error = wb.create_sheet("错误汇总")
                 error_rows = []
                 error_header_written = False
+
+                # V5.9.15: 从问题描述/结构化数据中解析涉及的PDF页码，供"页码"列定位
+                def _page_hint(text, check_data=None, sub_key=None):
+                    s = str(text or "")
+                    pages = re.findall(r'第\s*(\d+)\s*页', s)
+                    if not pages and isinstance(check_data, dict):
+                        # 结构化兜底：per_item_expiry / attachment_check / pn_field_check
+                        for key in ("expired_rohs", "expired_sgs"):
+                            for it in check_data.get(key, []) or []:
+                                if isinstance(it, dict) and it.get("item") and \
+                                        it.get("item") in s and it.get("page"):
+                                    pages.append(str(it["page"]))
+                        for it in check_data.get("items", []) or []:
+                            if isinstance(it, dict) and it.get("page") and \
+                                    (not sub_key or str(it.get("label", "")) in s):
+                                pages.append(str(it["page"]))
+                        for c in check_data.get("consistency_checks", []) or []:
+                            if isinstance(c, dict) and str(c.get("pn_detail", "")) in s:
+                                pages.extend(str(x) for x in (c.get("page_nums") or []))
+                    uniq = []
+                    for p in pages:
+                        p = str(p).strip()
+                        if p and p not in uniq:
+                            uniq.append(p)
+                    uniq.sort(key=lambda x: int(x) if x.isdigit() else 0)
+                    return "、".join(uniq) if uniq else ""
+
                 for res in detail_results:
                     dd = res.get("_detail", {})
                     issues_found = []
@@ -4460,6 +4557,7 @@ with col2:
                             issues_found.append({
                                 "文件名": res.get("文件名", ""),
                                 "检查类别": check_name,
+                                "页码": _page_hint(issue, check_data),
                                 "问题描述": str(issue)[:200],
                                 "严重程度": "❌ 不合格" if "不合格" in str(issue) else "⚠️ 警告",
                                 "建议操作": "请人工核实并补充相应资料或重新提交",
@@ -4470,6 +4568,7 @@ with col2:
                                 issues_found.append({
                                     "文件名": res.get("文件名", ""),
                                     "检查类别": check_name,
+                                    "页码": _page_hint(sub_v, check_data, sub_key=sub_k),
                                     "问题描述": f"{sub_k}: {sub_v}"[:200],
                                     "严重程度": "❌ 不合格" if "❌" in sub_v else "⚠️ 警告",
                                     "建议操作": "请人工核实并补充相应资料或重新提交",
@@ -4481,6 +4580,7 @@ with col2:
                         issues_found.append({
                             "文件名": res.get("文件名", ""),
                             "检查类别": "最终结论",
+                            "页码": "",
                             "问题描述": final.get("verdict", "") + " | " + final.get("suggestion", "")[:150],
                             "严重程度": "❌ 关键问题" if "不合格" in final.get("verdict", "") else "⚠️ 异常",
                             "建议操作": final.get("suggestion", "请人工复核")[:200],
@@ -4490,7 +4590,7 @@ with col2:
                 
                 if error_rows:
                     # 写表头
-                    err_headers = ["序号", "文件名", "检查类别", "问题描述", "严重程度", "建议操作"]
+                    err_headers = ["序号", "文件名", "检查类别", "页码", "问题描述", "严重程度", "建议操作"]
                     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
                     yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
                     red_font = Font(color="9C0006")
@@ -4522,13 +4622,14 @@ with col2:
                             elif "警告" in sev or "⚠️" in sev:
                                 cell.fill = yellow_fill
                     
-                    # 设置列宽
-                    ws_error.column_dimensions['A'].width = 6
-                    ws_error.column_dimensions['B'].width = 30
-                    ws_error.column_dimensions['C'].width = 14
-                    ws_error.column_dimensions['D'].width = 50
-                    ws_error.column_dimensions['E'].width = 12
-                    ws_error.column_dimensions['F'].width = 35
+                    # 设置列宽（V5.9.15: 新增"页码"列后重新对齐）
+                    ws_error.column_dimensions['A'].width = 6     # 序号
+                    ws_error.column_dimensions['B'].width = 30    # 文件名
+                    ws_error.column_dimensions['C'].width = 14    # 检查类别
+                    ws_error.column_dimensions['D'].width = 12    # 页码
+                    ws_error.column_dimensions['E'].width = 50    # 问题描述
+                    ws_error.column_dimensions['F'].width = 12    # 严重程度
+                    ws_error.column_dimensions['G'].width = 35    # 建议操作
                 else:
                     ws_error.cell(row=1, column=1, value="✅ 所有文件均通过审核，无错误项！")
                     ws_error.cell(row=1, column=1).font = Font(bold=True, size=14, color="006400")
