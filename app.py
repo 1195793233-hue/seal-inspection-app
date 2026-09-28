@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.17
+封样检验Web应用 - V5.9.18
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -17,6 +17,7 @@ V5.9.14新增：①附件形式报告检测（SGS/RoHS/REACH以.7z等压缩包�
 V5.9.15修复：①料号一致性检查完全失效——原按table_type排除且含"unknown"导致所有未分类表格被剔除、提前返回"未检测到表头信息"；改为按料号格式(K/R/M+9位以上数字)过滤并取消提前返回，新增可靠性/电气性能/材质证明/QC流程图等类型识别与页面标题兜底分类，按错误料号分组汇总并标注全部页码；②错误汇总Excel新增"页码"列，便于定位PDF中的问题位置
 V5.9.16修复：统一料号编码规则——全部料号正则按《物料编码规则》收紧为「K(结构料)/R(电子料) + 10位数字 + 可选1~2位字母后缀」（新增 INTERNAL_PN_CORE / INTERNAL_PN_FULL_RE / INTERNAL_PN_SEARCH_RE 与 is_internal_part_number() / extract_internal_pn()）；修复旧正则 K\\d{6,} 把第三方报告编号（A2260375586101、A2260558395101001E）与厂商编码误判为内部料号的问题
 V5.9.17修复：①新增 APP_CODE_VERSION 代码版本标识（界面顶部与侧边栏显示"代码版本"，与只反映 JSON 内容的"标准版本"区分开，可一眼确认线上跑的是哪一版 app.py）；②料号一致性彻底取消"提前返回"——旧逻辑某个来源为空就直接 return，界面只剩一句"未检测到…"，无法判断是封面/表头/文件名哪一步失效；现改为输出「料号检出诊断」（文件名料号、封面料号及其来源、检出表格数、被排除表格数、各表头料号明细）；③无任何可对比项时不再默认显示"✅ 全部一致"（假阳性），改为"⚠️ 未检出可对比的表头料号（请人工核对）"
+V5.9.18修复：封面料号提取错误根因——extract_cover_info 原对"前10页所有表格"做全表扫描，会把第4页 BOM 表"Part material number"单元格（如 CRS-K6990030057LA 文件中的 K6990030057LA）误当成封面料号，导致文件名&封面料号、封面料号vs各页表头料号全部基于错误料号判定。现限定表格扫描仅限封面页(_cover_page_nums)，封面料号严格取自封面原文（如 K6990000955LA）；并新增物料名称前缀标签剥离（"Product name产品名称："双语标签会漏过中文标签而把"产品名称 ："一并带入值，现已统一剥离）。
 """
 
 import streamlit as st
@@ -37,7 +38,7 @@ import gc  # V5.1: 内存管理 - 显式垃圾回收
 #   标准版本只反映 JSON 内容，代码版本才反映 app.py 的真实逻辑。
 #   ★ 每次改动 app.py 逻辑，必须同步 +1，否则无法定位线上版本。
 # ============================================================
-APP_CODE_VERSION = "V5.9.17"
+APP_CODE_VERSION = "V5.9.18"
 APP_CODE_DATE = "2026-09-28"
 
 # ============================================================
@@ -2400,11 +2401,17 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
                 break
 
     # V5.8.5 新增：优先从封面表格中提取（表格格式封面比文本提取更准确）
+    # V5.9.17 修复：表格扫描必须**限定在封面页**，否则会误抓第4页 BOM 表的
+    #   "Part material number" 栏（如 K6990030057LA）当作封面料号，
+    #   导致真正的封面"物料料号"字段（如第1页 K6990000955LA）被跳过。
     _cover_page_nums = set(p.get("page_num", 0) for p in cover_pages)
     if tables and (not result["part_number"] or not result["material_name"]):
         for t_dict in tables:
             tbl_page = t_dict.get("page", 0)
             if tbl_page > 5:  # 只搜索前5页的表格
+                continue
+            # V5.9.17: 仅当已识别出封面页时，限定在封面页表格内提取（BOM/RoHS表不含封面料号）
+            if _cover_page_nums and tbl_page not in _cover_page_nums:
                 continue
             tbl = t_dict.get("table", [])
             if not tbl or len(tbl) < 2:
@@ -2572,6 +2579,9 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
             tbl_page = t_dict.get("page", 0)
             if tbl_page > 10:  # 只搜索前10页
                 continue
+            # V5.9.17: 已识别出封面页时，该扫描同样限定在封面页表格，避免误抓BOM表
+            if _cover_page_nums and tbl_page not in _cover_page_nums:
+                continue
             tbl = t_dict.get("table", [])
             if not tbl:
                 continue
@@ -2641,6 +2651,22 @@ def extract_cover_info(page_analysis, pdf_path, tables=None):
         ]
         if any(re.match(pat, _mn, re.IGNORECASE) for pat in _label_only_patterns):
             result["material_name"] = ""
+
+    # V5.9.17: 去除物料名称前缀的标签词（双语标签如 "Product name产品名称：" 会被
+    # 正则的[\s:：]*漏过中文标签部分而一并带入值中，例如得到
+    # "产品名称 ： S3251_大小板_FPC_V1.0"；此处统一剥离前缀标签词+分隔符）
+    if result["material_name"]:
+        _mn2 = result["material_name"].strip()
+        _label_prefix_re = re.compile(
+            r'^(?:product\s*name|产品名称|物料名称|零件名称|材料名称|品名|名称|'
+            r'part\s*name|part\s*description|material\s*name|item\s*name|description)'
+            r'[\s:：\-—_·]*',
+            re.IGNORECASE
+        )
+        _stripped = _label_prefix_re.sub('', _mn2).strip()
+        # 仅当剥离后非空且不是纯标签才采用，避免把有效名称清空
+        if _stripped and not _looks_like_header_row(_stripped):
+            result["material_name"] = _stripped
 
     # V5.9.6: 最终校验 - 过滤掉误提取的纯标签词（如"PART"、"NO"、"Material"等）
     if result["part_number"]:
