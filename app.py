@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-封样检验Web应用 - V5.9.18
+封样检验Web应用 - V5.9.19
 基于 SKILL.md V4.0 (2026-06-23)
 实现PDF逐页分析、工程图纸判定规则、产品规格书判定规则
 V6.2新增：目录勾选状态检测、料号&物料名称跨表一致性检查
@@ -18,6 +18,7 @@ V5.9.15修复：①料号一致性检查完全失效——原按table_type排除
 V5.9.16修复：统一料号编码规则——全部料号正则按《物料编码规则》收紧为「K(结构料)/R(电子料) + 10位数字 + 可选1~2位字母后缀」（新增 INTERNAL_PN_CORE / INTERNAL_PN_FULL_RE / INTERNAL_PN_SEARCH_RE 与 is_internal_part_number() / extract_internal_pn()）；修复旧正则 K\\d{6,} 把第三方报告编号（A2260375586101、A2260558395101001E）与厂商编码误判为内部料号的问题
 V5.9.17修复：①新增 APP_CODE_VERSION 代码版本标识（界面顶部与侧边栏显示"代码版本"，与只反映 JSON 内容的"标准版本"区分开，可一眼确认线上跑的是哪一版 app.py）；②料号一致性彻底取消"提前返回"——旧逻辑某个来源为空就直接 return，界面只剩一句"未检测到…"，无法判断是封面/表头/文件名哪一步失效；现改为输出「料号检出诊断」（文件名料号、封面料号及其来源、检出表格数、被排除表格数、各表头料号明细）；③无任何可对比项时不再默认显示"✅ 全部一致"（假阳性），改为"⚠️ 未检出可对比的表头料号（请人工核对）"
 V5.9.18修复：封面料号提取错误根因——extract_cover_info 原对"前10页所有表格"做全表扫描，会把第4页 BOM 表"Part material number"单元格（如 CRS-K6990030057LA 文件中的 K6990030057LA）误当成封面料号，导致文件名&封面料号、封面料号vs各页表头料号全部基于错误料号判定。现限定表格扫描仅限封面页(_cover_page_nums)，封面料号严格取自封面原文（如 K6990000955LA）；并新增物料名称前缀标签剥离（"Product name产品名称："双语标签会漏过中文标签而把"产品名称 ："一并带入值，现已统一剥离）。
+V5.9.19修复：料号检出诊断 expander 嵌套崩溃——V5.9.17 新增的"🔍 料号检出诊断"用了 st.expander，但该处位于"每个文件的审核结果"外层 st.expander 之内，Streamlit 禁止 expander 嵌套 expander，命中即抛 StreamlitAPIException(_check_nested_element_violation) 导致整页报错。现改为内联小节（markdown 标题 + dataframe）展示诊断信息，外层 expander 本身已可整体折叠。
 """
 
 import streamlit as st
@@ -38,7 +39,7 @@ import gc  # V5.1: 内存管理 - 显式垃圾回收
 #   标准版本只反映 JSON 内容，代码版本才反映 app.py 的真实逻辑。
 #   ★ 每次改动 app.py 逻辑，必须同步 +1，否则无法定位线上版本。
 # ============================================================
-APP_CODE_VERSION = "V5.9.18"
+APP_CODE_VERSION = "V5.9.19"
 APP_CODE_DATE = "2026-09-28"
 
 # ============================================================
@@ -4519,25 +4520,29 @@ with col2:
                         #   避免只显示一句"未检测到"而无法定位问题
                         _diag = pc.get("diag")
                         if isinstance(_diag, dict) and _diag:
-                            with st.expander("🔍 料号检出诊断（点开确认各来源抓到了什么）", expanded=False):
+                            # V5.9.19: 修复嵌套 expander 崩溃 —— 外层（每个文件的结果区）本身已是
+                            #   st.expander，Streamlit 禁止 expander 嵌套 expander，否则抛
+                            #   StreamlitAPIException(_check_nested_element_violation)。
+                            #   改为内联小节展示诊断信息（外层 expander 已可整体折叠，无需再套一层）。
+                            st.markdown("**🔍 料号检出诊断（各来源抓到了什么）**")
+                            st.dataframe(
+                                pd.DataFrame([{"项目": k, "值": str(v)} for k, v in _diag.items()]),
+                                use_container_width=True, hide_index=True,
+                            )
+                            _ti_list = pc.get("table_infos") or []
+                            if _ti_list:
+                                st.markdown(f"**各表头检出的料号（共 {len(_ti_list)} 条）**")
                                 st.dataframe(
-                                    pd.DataFrame([{"项目": k, "值": str(v)} for k, v in _diag.items()]),
+                                    pd.DataFrame([{
+                                        "页码": t.get("page_num"),
+                                        "报告类型": t.get("table_type"),
+                                        "料号": t.get("part_number"),
+                                        "物料名称": str(t.get("material_name") or "")[:40],
+                                    } for t in _ti_list]),
                                     use_container_width=True, hide_index=True,
                                 )
-                                _ti_list = pc.get("table_infos") or []
-                                if _ti_list:
-                                    st.markdown(f"**各表头检出的料号（共 {len(_ti_list)} 条）**")
-                                    st.dataframe(
-                                        pd.DataFrame([{
-                                            "页码": t.get("page_num"),
-                                            "报告类型": t.get("table_type"),
-                                            "料号": t.get("part_number"),
-                                            "物料名称": str(t.get("material_name") or "")[:40],
-                                        } for t in _ti_list]),
-                                        use_container_width=True, hide_index=True,
-                                    )
-                                else:
-                                    st.warning("未从任何报告表头提取到料号 —— 若该 PDF 是扫描件（无文本层），属正常情况，需人工核对。")
+                            else:
+                                st.warning("未从任何报告表头提取到料号 —— 若该 PDF 是扫描件（无文本层），属正常情况，需人工核对。")
 
                     # V5.9.2 新增：封面供应商信息完整性
                     if d.get("supplier_check"):
